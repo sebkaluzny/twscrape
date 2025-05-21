@@ -1,5 +1,5 @@
 import os
-from prometheus_client import Counter, Gauge, start_http_server, Histogram, CollectorRegistry
+from prometheus_client import Counter, Gauge, start_http_server, Histogram,CollectorRegistry
 
 metrics_reg = CollectorRegistry()
 
@@ -7,7 +7,7 @@ metrics_reg = CollectorRegistry()
 api_calls_total = Counter(
     "twscrape_api_calls_total",
     "Total number of API calls made",
-    ["operation",, "method", "status_code", "outcome"],
+    ["operation", "method", "status_code", "outcome"],
     # outcome: success, http_error, ratelimited, ban_detected, dependency_error, auth_error, missing_content, unknown_api_error, handled_error_retry, aborted_request, network_error_retry
     registry=metrics_reg,
 )
@@ -15,7 +15,7 @@ api_calls_total = Counter(
 api_call_latency = Histogram(
     "twscrape_api_call_latency_seconds",
     "Latency of API calls",
-    ["operation", ,"method"],
+    ["operation", "method"],
     registry=metrics_reg,
 )
 
@@ -23,14 +23,14 @@ api_call_latency = Histogram(
 account_pool_requests_total = Counter(
     "twscrape_account_pool_requests_total",
     "Total number of requests to the account pool for an account",
-    ["queue", "status"],  # s,tatus: success, no_account_available, waiting, no_account_raised
+    ["queue", "status"],  # status: success, no_account_available, waiting, no_account_raised
     registry=metrics_reg,
 )
 
 account_status_gauge = Gauge(
     "twscrape_account_status_count",
     "Number of accounts by status",
-    ["status"]  # stat,us: active, inactive, error
+    ["status"],  # status: active, inactive, error
     registry=metrics_reg,
 )
 
