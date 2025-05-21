@@ -6,6 +6,7 @@ from urllib.parse import urlparse
 
 import httpx
 from httpx import AsyncClient, Response
+from twscrape import metrics
 
 from .accounts_pool import Account, AccountsPool
 from .logger import logger
@@ -181,38 +182,48 @@ class QueueClient:
             err_msg = set([f"({x.get('code', -1)}) {x['message']}" for x in res["errors"]])
             err_msg = "; ".join(list(err_msg))
 
+        op_name = self.queue # Use queue name as operation name
+        req_method = rep.request.method
+        status_code_str = str(rep.status_code)
+
         log_msg = f"{rep.status_code:3d} - {req_id(rep)} - {err_msg}"
         logger.trace(log_msg)
 
         # for dev: need to add some features in api.py
         if err_msg.startswith("(336) The following features cannot be null"):
             logger.error(f"[DEV] Update required: {err_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='unknown_api_error').inc()
             exit(1)
 
         # general api rate limit
         if limit_remaining == 0 and limit_reset > 0:
             logger.debug(f"Rate limited: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='ratelimited').inc()
             await self._close_ctx(limit_reset)
             raise HandledError()
 
         # no way to check is account banned in direct way, but this check should work
         if err_msg.startswith("(88) Rate limit exceeded") and limit_remaining > 0:
             logger.warning(f"Ban detected: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='ban_detected').inc()
             await self._close_ctx(-1, inactive=True, msg=err_msg)
             raise HandledError()
 
         if err_msg.startswith("(326) Authorization: Denied by access control"):
             logger.warning(f"Ban detected: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='ban_detected').inc()
             await self._close_ctx(-1, inactive=True, msg=err_msg)
             raise HandledError()
 
         if err_msg.startswith("(32) Could not authenticate you"):
             logger.warning(f"Session expired or banned: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='exp_or_ban_detected').inc()
             await self._close_ctx(-1, inactive=True, msg=err_msg)
             raise HandledError()
 
         if err_msg == "OK" and rep.status_code == 403:
             logger.warning(f"Session expired or banned: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='exp_or_ban_detected').inc()
             await self._close_ctx(-1, inactive=True, msg=None)
             raise HandledError()
 
@@ -224,25 +235,31 @@ class QueueClient:
                 err_msg = "OK"
             else:
                 logger.warning(f"Dependency error (request skipped): {err_msg}")
+                metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='dependency_error').inc()
                 raise AbortReqError()
 
         # content not found
         if rep.status_code == 200 and "_Missing: No status found with that ID" in err_msg:
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='missing_content').inc()
             return  # ignore this error
 
         # something from twitter side - just ignore it, see: https://github.com/vladkens/twscrape/pull/95
         if rep.status_code == 200 and "Authorization" in err_msg:
             logger.warning(f"Authorization unknown error: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='auth_error').inc()
             return
 
         if err_msg != "OK":
             logger.warning(f"API unknown error: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='unknown_api_error').inc()
             return  # ignore any other unknown errors
 
         try:
             rep.raise_for_status()
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='success').inc()
         except httpx.HTTPStatusError:
             logger.error(f"Unhandled API response code: {log_msg}")
+            metrics.api_calls_total.labels(operation=op_name, method=req_method, status_code=status_code_str, outcome='http_error').inc()
             await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
             raise HandledError()
 
@@ -266,20 +283,24 @@ class QueueClient:
                 unknown_retry, connection_retry = 0, 0
                 return rep
             except AbortReqError:
+                metrics.api_calls_total.labels(operation=self.queue, method=method, status_code='N/A', outcome='aborted_request').inc()
                 # abort all queries
                 return
             except HandledError:
                 # retry with new account
                 continue
             except (httpx.ReadTimeout, httpx.ProxyError):
+                metrics.api_calls_total.labels(operation=self.queue, method=method, status_code='N/A', outcome='timout_or_proxy_error').inc()
                 # http transport failed, just retry with same account
                 continue
             except (httpx.ConnectError, httpx.ConnectTimeout) as e:
                 # if proxy missconfigured or ???
                 connection_retry += 1
+                metrics.api_calls_total.labels(operation=self.queue, method=method, status_code='N/A', outcome='network_error_retry').inc()
                 if connection_retry >= 3:
                     raise e
             except Exception as e:
+                metrics.api_calls_total.labels(operation=self.queue, method=method, status_code='N/A', outcome='unknown_api_error').inc()
                 unknown_retry += 1
                 if unknown_retry >= 3:
                     msg = [

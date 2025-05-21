@@ -5,3 +5,4 @@ from .api import API
 from .logger import set_log_level
 from .models import *  # noqa: F403
 from .utils import gather
+from .metrics import start_metrics_http_server

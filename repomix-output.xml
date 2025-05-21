@@ -1,0 +1,3775 @@
+This file is a merged representation of the entire codebase, combined into a single document by Repomix.
+
+<file_summary>
+This section contains a summary of this file.
+
+<purpose>
+This file contains a packed representation of the entire repository's contents.
+It is designed to be easily consumable by AI systems for analysis, code review,
+or other automated processes.
+</purpose>
+
+<file_format>
+The content is organized as follows:
+1. This summary section
+2. Repository information
+3. Directory structure
+4. Repository files (if enabled)
+5. Multiple file entries, each consisting of:
+  - File path as an attribute
+  - Full contents of the file
+</file_format>
+
+<usage_guidelines>
+- This file should be treated as read-only. Any changes should be made to the
+  original repository files, not this packed version.
+- When processing this file, use the file path to distinguish
+  between different files in the repository.
+- Be aware that this file may contain sensitive information. Handle it with
+  the same level of security as you would the original repository.
+</usage_guidelines>
+
+<notes>
+- Some files may have been excluded based on .gitignore rules and Repomix's configuration
+- Binary files are not included in this packed representation. Please refer to the Repository Structure section for a complete list of file paths, including binary files
+- Files matching patterns in .gitignore are excluded
+- Files matching default ignore patterns are excluded
+- Files are sorted by Git change count (files with more changes are at the bottom)
+</notes>
+
+</file_summary>
+
+<directory_structure>
+twscrape/
+  __init__.py
+  account.py
+  accounts_pool.py
+  api.py
+  cli.py
+  db.py
+  imap.py
+  logger.py
+  login.py
+  models.py
+  queue_client.py
+  utils.py
+  xclid.py
+_get_gql_ops.py
+.dockerignore
+.gitattributes
+.gitignore
+Dockerfile.py-matrix
+Dockerfile.sq-matrix
+LICENSE
+Makefile
+pyproject.toml
+</directory_structure>
+
+<files>
+This section contains the contents of the repository's files.
+
+<file path="LICENSE">
+MIT License
+
+Copyright (c) 2023 vladkens
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+</file>
+
+<file path="twscrape/__init__.py">
+# ruff: noqa: F401
+from .account import Account
+from .accounts_pool import AccountsPool, NoAccountError
+from .api import API
+from .logger import set_log_level
+from .models import *  # noqa: F403
+from .utils import gather
+</file>
+
+<file path=".dockerignore">
+.DS_Store
+.ruff_cache/
+.coverage
+accounts/
+results-raw/
+results-parsed/
+accounts.db*
+data/
+data_media/
+dist/
+</file>
+
+<file path=".gitignore">
+.DS_Store
+.ruff_cache/
+.coverage
+accounts/
+results-raw/
+results-parsed/
+accounts.db*
+data/
+data_media/
+dist/
+tests/
+.vscode/
+.github/
+examples/
+</file>
+
+<file path="Dockerfile.py-matrix">
+ARG VER=3.12
+
+FROM python:${VER}-alpine
+RUN apk add git
+
+WORKDIR /app
+COPY pyproject.toml readme.md /app/
+RUN pip install -e .[dev]
+COPY . /app
+
+CMD ["sh", "-c", "pytest tests/"]
+</file>
+
+<file path="twscrape/db.py">
+import asyncio
+import random
+import sqlite3
+from collections import defaultdict
+
+import aiosqlite
+
+from .logger import logger
+
+MIN_SQLITE_VERSION = "3.24"
+
+_lock = asyncio.Lock()
+
+
+def lock_retry(max_retries=10):
+    # this lock decorator has double nature:
+    # 1. it uses asyncio lock in same process
+    # 2. it retries when db locked by other process (eg. two cli instances running)
+    def decorator(func):
+        async def wrapper(*args, **kwargs):
+            for i in range(max_retries):
+                try:
+                    async with _lock:
+                        return await func(*args, **kwargs)
+                except sqlite3.OperationalError as e:
+                    if i == max_retries - 1 or "database is locked" not in str(e):
+                        raise e
+
+                    await asyncio.sleep(random.uniform(0.5, 1.0))
+
+        return wrapper
+
+    return decorator
+
+
+async def get_sqlite_version():
+    async with aiosqlite.connect(":memory:") as db:
+        async with db.execute("SELECT SQLITE_VERSION()") as cur:
+            rs = await cur.fetchone()
+            return rs[0] if rs else "3.0.0"
+
+
+async def check_version():
+    ver = await get_sqlite_version()
+    ver = ".".join(ver.split(".")[:2])
+
+    try:
+        msg = f"SQLite version '{ver}' is too old, please upgrade to {MIN_SQLITE_VERSION}+"
+        if float(ver) < float(MIN_SQLITE_VERSION):
+            raise SystemError(msg)
+    except ValueError:
+        pass
+
+
+async def migrate(db: aiosqlite.Connection):
+    async with db.execute("PRAGMA user_version") as cur:
+        rs = await cur.fetchone()
+        uv = rs[0] if rs else 0
+
+    async def v1():
+        qs = """
+        CREATE TABLE IF NOT EXISTS accounts (
+            username TEXT PRIMARY KEY NOT NULL COLLATE NOCASE,
+            password TEXT NOT NULL,
+            email TEXT NOT NULL COLLATE NOCASE,
+            email_password TEXT NOT NULL,
+            user_agent TEXT NOT NULL,
+            active BOOLEAN DEFAULT FALSE NOT NULL,
+            locks TEXT DEFAULT '{}' NOT NULL,
+            headers TEXT DEFAULT '{}' NOT NULL,
+            cookies TEXT DEFAULT '{}' NOT NULL,
+            proxy TEXT DEFAULT NULL,
+            error_msg TEXT DEFAULT NULL
+        );"""
+        await db.execute(qs)
+
+    async def v2():
+        await db.execute("ALTER TABLE accounts ADD COLUMN stats TEXT DEFAULT '{}' NOT NULL")
+        await db.execute("ALTER TABLE accounts ADD COLUMN last_used TEXT DEFAULT NULL")
+
+    async def v3():
+        await db.execute("ALTER TABLE accounts ADD COLUMN _tx TEXT DEFAULT NULL")
+
+    async def v4():
+        await db.execute("ALTER TABLE accounts ADD COLUMN mfa_code TEXT DEFAULT NULL")
+
+    migrations = {
+        1: v1,
+        2: v2,
+        3: v3,
+        4: v4,
+    }
+
+    # logger.debug(f"Current migration v{uv} (latest v{len(migrations)})")
+    for i in range(uv + 1, len(migrations) + 1):
+        logger.info(f"Running migration to v{i}")
+        try:
+            await migrations[i]()
+        except sqlite3.OperationalError as e:
+            if "duplicate column name" not in str(e):
+                raise e
+
+        await db.execute(f"PRAGMA user_version = {i}")
+        await db.commit()
+
+
+class DB:
+    _init_queries: defaultdict[str, list[str]] = defaultdict(list)
+    _init_once: defaultdict[str, bool] = defaultdict(bool)
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.conn = None
+
+    async def __aenter__(self):
+        await check_version()
+        db = await aiosqlite.connect(self.db_path)
+        db.row_factory = aiosqlite.Row
+
+        if not self._init_once[self.db_path]:
+            await migrate(db)
+            self._init_once[self.db_path] = True
+
+        self.conn = db
+        return db
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.conn:
+            await self.conn.commit()
+            await self.conn.close()
+
+
+@lock_retry()
+async def execute(db_path: str, qs: str, params: dict | None = None):
+    async with DB(db_path) as db:
+        await db.execute(qs, params)
+
+
+@lock_retry()
+async def fetchone(db_path: str, qs: str, params: dict | None = None):
+    async with DB(db_path) as db:
+        async with db.execute(qs, params) as cur:
+            row = await cur.fetchone()
+            return row
+
+
+@lock_retry()
+async def fetchall(db_path: str, qs: str, params: dict | None = None):
+    async with DB(db_path) as db:
+        async with db.execute(qs, params) as cur:
+            rows = await cur.fetchall()
+            return rows
+
+
+@lock_retry()
+async def executemany(db_path: str, qs: str, params: list[dict]):
+    async with DB(db_path) as db:
+        await db.executemany(qs, params)
+</file>
+
+<file path="twscrape/xclid.py">
+import base64
+import hashlib
+import json
+import math
+import random
+import re
+import time
+
+import bs4
+import httpx
+from fake_useragent import UserAgent
+
+
+def _make_client() -> httpx.AsyncClient:
+    headers = {"user-agent": UserAgent().chrome}
+    return httpx.AsyncClient(headers=headers, follow_redirects=True)
+
+
+async def get_tw_page_text(url: str, clt: httpx.AsyncClient | None = None):
+    clt = clt or _make_client()
+    rep = await clt.get(url)
+
+    rep.raise_for_status()
+    if ">document.location =" not in rep.text:
+        return rep.text
+
+    url = rep.text.split('document.location = "')[1].split('"')[0]
+    rep = await clt.get(url)
+    rep.raise_for_status()
+    if 'action="https://x.com/x/migrate" method="post"' not in rep.text:
+        return rep.text
+
+    data = {}
+    for x in rep.text.split("<input")[1:]:
+        name = x.split('name="')[1].split('"')[0]
+        value = x.split('value="')[1].split('"')[0]
+        data[name] = value
+
+    rep = await clt.post("https://x.com/x/migrate", json=data)
+    rep.raise_for_status()
+
+    return rep.text
+
+
+def script_url(k: str, v: str):
+    return f"https://abs.twimg.com/responsive-web/client-web/{k}.{v}.js"
+
+
+def get_scripts_list(text: str):
+    scripts = text.split('e=>e+"."+')[1].split('[e]+"a.js"')[0]
+    try:
+        for k, v in json.loads(scripts).items():
+            yield script_url(k, f"{v}a")
+    except json.decoder.JSONDecodeError as e:
+        raise Exception("Failed to parse scripts") from e
+
+
+# MARK: XClientTxId parsing
+
+# Code mostly taken from https://github.com/iSarabjitDhiman/XClientTransaction (MIT licensed)
+# Many thanks to @SarabjitDhiman for the original code and investigating the algorithm.
+# Articles with more details:
+# https://antibot.blog/posts/1741552025433
+# https://antibot.blog/posts/1741552092462
+# https://antibot.blog/posts/1741552163416
+
+
+INDICES_REGEX = re.compile(r"(\(\w{1}\[(\d{1,2})\],\s*16\))+", flags=(re.VERBOSE | re.MULTILINE))
+
+
+class Cubic:  # cubic_curve.py
+    def __init__(self, curves: list[float]):
+        self.curves = curves
+
+    def get_value(self, time: float) -> float:
+        start_gradient = end_gradient = start = mid = 0.0
+        end = 1.0
+
+        if time <= 0.0:
+            if self.curves[0] > 0.0:
+                start_gradient = self.curves[1] / self.curves[0]
+            elif self.curves[1] == 0.0 and self.curves[2] > 0.0:
+                start_gradient = self.curves[3] / self.curves[2]
+            return start_gradient * time
+
+        if time >= 1.0:
+            if self.curves[2] < 1.0:
+                end_gradient = (self.curves[3] - 1.0) / (self.curves[2] - 1.0)
+            elif self.curves[2] == 1.0 and self.curves[0] < 1.0:
+                end_gradient = (self.curves[1] - 1.0) / (self.curves[0] - 1.0)
+            return 1.0 + end_gradient * (time - 1.0)
+
+        while start < end:
+            mid = (start + end) / 2
+            x_est = self.calculate(self.curves[0], self.curves[2], mid)
+            if abs(time - x_est) < 0.00001:
+                return self.calculate(self.curves[1], self.curves[3], mid)
+            if x_est < time:
+                start = mid
+            else:
+                end = mid
+        return self.calculate(self.curves[1], self.curves[3], mid)
+
+    @staticmethod
+    def calculate(a: float, b: float, m: float) -> float:
+        return 3.0 * a * (1 - m) * (1 - m) * m + 3.0 * b * (1 - m) * m * m + m * m * m
+
+
+def interpolate(from_list: list[float], to_list: list[float], f: float):
+    assert len(from_list) == len(to_list), f"Mismatched interpolation args {from_list}: {to_list}"
+    return [a * (1 - f) + b * f for a, b in zip(from_list, to_list)]
+
+
+def get_rotation_matrix(rotation: float):
+    rad = math.radians(rotation)
+    return [math.cos(rad), -math.sin(rad), math.sin(rad), math.cos(rad)]
+
+
+def solve(value: float, min_val: float, max_val: float, rounding: bool):
+    result = value * (max_val - min_val) / 255 + min_val
+    return math.floor(result) if rounding else round(result, 2)
+
+
+def float_to_hex(x):
+    # todo: ?
+    result = []
+    quotient = int(x)
+    fraction = x - quotient
+
+    while quotient > 0:
+        quotient = int(x / 16)
+        remainder = int(x - (float(quotient) * 16))
+
+        if remainder > 9:
+            result.insert(0, chr(remainder + 55))
+        else:
+            result.insert(0, str(remainder))
+
+        x = float(quotient)
+
+    if fraction == 0:
+        return "".join(result)
+
+    result.append(".")
+
+    while fraction > 0:
+        fraction *= 16
+        integer = int(fraction)
+        fraction -= float(integer)
+
+        if integer > 9:
+            result.append(chr(integer + 55))
+        else:
+            result.append(str(integer))
+
+    return "".join(result)
+
+
+def cacl_anim_key(frames: list[float], target_time: float) -> str:
+    from_color = [*frames[:3], 1]
+    to_color = [*frames[3:6], 1]
+    from_rotation = [0.0]
+    to_rotation = [solve(frames[6], 60.0, 360.0, True)]
+
+    frames = frames[7:]
+    curves = [solve(x, -1.0 if i % 2 else 0.0, 1.0, False) for i, x in enumerate(frames)]
+    val = Cubic(curves).get_value(target_time)
+
+    color = interpolate(from_color, to_color, val)
+    color = [value if value > 0 else 0 for value in color]
+    rotation = interpolate(from_rotation, to_rotation, val)
+
+    matrix = get_rotation_matrix(rotation[0])
+    str_arr = [format(round(value), "x") for value in color[:-1]]
+    for value in matrix:
+        rounded = round(value, 2)
+        if rounded < 0:
+            rounded = -rounded
+        hex_value = float_to_hex(rounded)
+        str_arr.append(
+            f"0{hex_value}".lower()
+            if hex_value.startswith(".")
+            else hex_value
+            if hex_value
+            else "0"
+        )
+
+    str_arr.extend(["0", "0"])
+    return re.sub(r"[.-]", "", "".join(str_arr))
+
+
+def parse_vk_bytes(soup: bs4.BeautifulSoup) -> list[int]:
+    el = soup.find("meta", {"name": "twitter-site-verification", "content": True})
+    el = str(el.get("content")) if el and isinstance(el, bs4.Tag) else None
+    if not el:
+        raise Exception("Couldn't get XClientTxId key bytes")
+
+    return list(base64.b64decode(bytes(el, "utf-8")))
+
+
+async def parse_anim_idx(text: str) -> list[int]:
+    scripts = list(get_scripts_list(text))
+    scripts = [x for x in scripts if "/ondemand.s." in x]
+    if not scripts:
+        raise Exception("Couldn't get XClientTxId scripts")
+
+    text = await get_tw_page_text(scripts[0])
+
+    items = [int(x.group(2)) for x in INDICES_REGEX.finditer(text)]
+    if not items:
+        raise Exception("Couldn't get XClientTxId indices")
+
+    return items
+
+
+def parse_anim_arr(soup: bs4.BeautifulSoup, vk_bytes: list[int]) -> list[list[float]]:
+    # https://github.com/fa0311/twitter-tid-deobf/blob/c4fd61c36/output/a.js#L18
+    els = list(soup.select("svg[id^='loading-x-anim'] g:first-child path:nth-child(2)"))
+    els = [str(x.get("d") or "").strip() for x in els]
+    if not els:
+        raise Exception("Couldn't get XClientTxId animation array")
+
+    idx = vk_bytes[5] % len(els)
+    dat = els[idx][9:].split("C")
+    arr = [list(map(float, re.sub(r"[^\d]+", " ", x).split())) for x in dat]
+    return arr
+
+
+async def load_keys(soup: bs4.BeautifulSoup) -> tuple[list[int], str]:
+    anim_idx = await parse_anim_idx(str(soup))
+    vk_bytes = parse_vk_bytes(soup)
+    anim_arr = parse_anim_arr(soup, vk_bytes)
+
+    frame_time = 1
+    for x in anim_idx[1:]:
+        frame_time *= vk_bytes[x] % 16
+
+    frame_idx = vk_bytes[anim_idx[0]] % 16
+    frame_row = anim_arr[frame_idx]
+    frame_dur = float(frame_time) / 4096
+
+    anim_key = cacl_anim_key(frame_row, frame_dur)
+    return vk_bytes, anim_key
+
+
+class XClIdGen:
+    @staticmethod
+    async def create(clt: httpx.AsyncClient | None = None) -> "XClIdGen":
+        text = await get_tw_page_text("https://x.com/tesla", clt=clt)
+        soup = bs4.BeautifulSoup(text, "html.parser")
+
+        vk_bytes, anim_key = await load_keys(soup)
+        clid_gen = XClIdGen(vk_bytes, anim_key)
+        return clid_gen
+
+    def __init__(self, vk_bytes: list[int], anim_key: str):
+        self.vk_bytes = vk_bytes
+        self.anim_key = anim_key
+
+    def calc(self, method: str, path: str) -> str:
+        ts = math.floor((time.time() * 1000 - 1682924400 * 1000) / 1000)
+        ts_bytes = [(ts >> (i * 8)) & 0xFF for i in range(4)]
+
+        dkw, drn = "obfiowerehiring", 3  # default keyword and random number
+        pld = f"{method.upper()}!{path}!{ts}{dkw}{self.anim_key}"
+        pld = list(hashlib.sha256(pld.encode()).digest())
+        pld = [*self.vk_bytes, *ts_bytes, *pld[:16], drn]
+
+        num = random.randint(0, 255)
+        pld = bytearray([num, *[x ^ num for x in pld]])
+        out = base64.b64encode(pld).decode("utf-8").strip("=")
+        return out
+
+
+# MARK: Demo code
+
+
+async def main():
+    text = await get_tw_page_text("https://x.com/elonmusk")
+    soup = bs4.BeautifulSoup(text, "html.parser")
+
+    vk_bytes, anim_key = await load_keys(soup)
+    clid_gen = XClIdGen(vk_bytes, anim_key)
+
+    method = "GET"
+    path = "/i/api/graphql/AIdc203rPpK_k_2KWSdm7g/SearchTimeline"
+    clid = clid_gen.calc(method, path)
+    print(clid)
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(main())
+</file>
+
+<file path=".gitattributes">
+tests/mocked-data/* linguist-generated=true
+</file>
+
+<file path="Dockerfile.sq-matrix">
+FROM python:3.10-alpine
+RUN apk add build-base
+
+ARG SQLY=2021
+ARG SQLV=3340100
+
+RUN wget https://sqlite.org/${SQLY}/sqlite-autoconf-${SQLV}.tar.gz -O sqlite.tar.gz \
+    && tar xvfz sqlite.tar.gz \
+    && cd sqlite-autoconf-${SQLV} \
+    && ./configure --prefix=/usr/local --build=aarch64-unknown-linux-gnu \
+    && make \
+    && make install \
+    && cd .. \
+    && rm -rf sqlite*
+
+WORKDIR /app
+COPY pyproject.toml readme.md /app/
+RUN pip install -e .[dev]
+COPY . /app
+
+CMD ["sh", "-c", "sqlite3 --version; python -c 'import sqlite3;print(sqlite3.sqlite_version)'; pytest tests/"]
+</file>
+
+<file path="twscrape/logger.py">
+import os
+import sys
+from typing import Literal, cast
+
+from loguru import logger
+
+_TLOGLEVEL = Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+
+def _load_from_env() -> _TLOGLEVEL:
+    env = os.getenv("TWS_LOG_LEVEL", "INFO").upper()
+    if env not in ["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+        logger.warning(f"Invalid log level '{env}' in TWS_LOG_LEVEL. Defaulting to INFO.")
+        return "INFO"
+
+    return cast(_TLOGLEVEL, env)
+
+
+_LOG_LEVEL: _TLOGLEVEL = _load_from_env()
+
+
+def set_log_level(level: _TLOGLEVEL):
+    global _LOG_LEVEL
+    _LOG_LEVEL = level
+
+
+def _filter(r):
+    return r["level"].no >= logger.level(_LOG_LEVEL).no
+
+
+logger.remove()
+logger.add(sys.stderr, filter=_filter)
+</file>
+
+<file path="twscrape/utils.py">
+import base64
+import json
+import os
+from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Any, AsyncGenerator, Callable, TypeVar
+
+T = TypeVar("T")
+
+
+class utc:
+    @staticmethod
+    def now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def from_iso(iso: str) -> datetime:
+        return datetime.fromisoformat(iso).replace(tzinfo=timezone.utc)
+
+    @staticmethod
+    def ts() -> int:
+        return int(utc.now().timestamp())
+
+
+async def gather(gen: AsyncGenerator[T, None]) -> list[T]:
+    items = []
+    async for x in gen:
+        items.append(x)
+    return items
+
+
+def encode_params(obj: dict):
+    res = {}
+    for k, v in obj.items():
+        if isinstance(v, dict):
+            v = {a: b for a, b in v.items() if b is not None}
+            v = json.dumps(v, separators=(",", ":"))
+
+        res[k] = str(v)
+
+    return res
+
+
+def get_or(obj: dict, key: str, default_value: T = None) -> Any | T:
+    for part in key.split("."):
+        if part not in obj:
+            return default_value
+        obj = obj[part]
+    return obj
+
+
+def int_or(obj: dict, key: str, default_value: int | None = None):
+    try:
+        val = get_or(obj, key)
+        return int(val) if val is not None else default_value
+    except Exception:
+        return default_value
+
+
+# https://stackoverflow.com/a/43184871
+def get_by_path(obj: dict, key: str, default=None):
+    stack = [iter(obj.items())]
+    while stack:
+        for k, v in stack[-1]:
+            if k == key:
+                return v
+            elif isinstance(v, dict):
+                stack.append(iter(v.items()))
+                break
+            elif isinstance(v, list):
+                stack.append(iter(enumerate(v)))
+                break
+        else:
+            stack.pop()
+    return default
+
+
+def find_item(lst: list[T], fn: Callable[[T], bool]) -> T | None:
+    for item in lst:
+        if fn(item):
+            return item
+    return None
+
+
+def find_or_fail(lst: list[T], fn: Callable[[T], bool]) -> T:
+    item = find_item(lst, fn)
+    if item is None:
+        raise ValueError()
+    return item
+
+
+def find_obj(obj: dict, fn: Callable[[dict], bool]) -> Any | None:
+    if not isinstance(obj, dict):
+        return None
+
+    if fn(obj):
+        return obj
+
+    for _, v in obj.items():
+        if isinstance(v, dict):
+            if res := find_obj(v, fn):
+                return res
+        elif isinstance(v, list):
+            for x in v:
+                if res := find_obj(x, fn):
+                    return res
+
+    return None
+
+
+def get_typed_object(obj: dict, res: defaultdict[str, list]):
+    obj_type = obj.get("__typename", None)
+    if obj_type is not None:
+        res[obj_type].append(obj)
+
+    for _, v in obj.items():
+        if isinstance(v, dict):
+            get_typed_object(v, res)
+        elif isinstance(v, list):
+            for x in v:
+                if isinstance(x, dict):
+                    get_typed_object(x, res)
+
+    return res
+
+
+def to_old_obj(obj: dict):
+    return {
+        **obj,
+        **obj["legacy"],
+        "id_str": str(obj["rest_id"]),
+        "id": int(obj["rest_id"]),
+        "legacy": None,
+    }
+
+
+def to_old_rep(obj: dict) -> dict[str, dict]:
+    tmp = get_typed_object(obj, defaultdict(list))
+
+    tw1 = [x for x in tmp.get("Tweet", []) if "legacy" in x]
+    tw1 = {str(x["rest_id"]): to_old_obj(x) for x in tw1}
+
+    # https://github.com/vladkens/twscrape/issues/53
+    tw2 = [x["tweet"] for x in tmp.get("TweetWithVisibilityResults", []) if "legacy" in x["tweet"]]
+    tw2 = {str(x["rest_id"]): to_old_obj(x) for x in tw2}
+
+    users = [x for x in tmp.get("User", []) if "legacy" in x and "id" in x]
+    users = {str(x["rest_id"]): to_old_obj(x) for x in users}
+
+    trends = [x for x in tmp.get("TimelineTrend", [])]
+    trends = {x["name"]: x for x in trends}
+
+    return {"tweets": {**tw1, **tw2}, "users": users, "trends": trends}
+
+
+def print_table(rows: list[dict], hr_after=False):
+    if not rows:
+        return
+
+    def prt(x):
+        if isinstance(x, str):
+            return x
+
+        if isinstance(x, int):
+            return f"{x:,}"
+
+        if isinstance(x, datetime):
+            return x.isoformat().split("+")[0].replace("T", " ")
+
+        return str(x)
+
+    keys = list(rows[0].keys())
+    rows = [{k: k for k in keys}, *[{k: prt(x.get(k, "")) for k in keys} for x in rows]]
+    colw = [max(len(x[k]) for x in rows) + 1 for k in keys]
+
+    lines = []
+    for row in rows:
+        line = [f"{row[k]:<{colw[i]}}" for i, k in enumerate(keys)]
+        lines.append(" ".join(line))
+
+    max_len = max(len(x) for x in lines)
+    # lines.insert(1, "─" * max_len)
+    # lines.insert(0, "─" * max_len)
+    print("\n".join(lines))
+    if hr_after:
+        print("-" * max_len)
+
+
+def parse_cookies(val: str) -> dict[str, str]:
+    try:
+        val = base64.b64decode(val).decode()
+    except Exception:
+        pass
+
+    try:
+        try:
+            res = json.loads(val)
+            if isinstance(res, dict) and "cookies" in res:
+                res = res["cookies"]
+
+            if isinstance(res, list):
+                return {x["name"]: x["value"] for x in res}
+            if isinstance(res, dict):
+                return res
+        except json.JSONDecodeError:
+            res = val.split("; ")
+            res = [x.split("=") for x in res]
+            return {x[0]: x[1] for x in res}
+    except Exception:
+        pass
+
+    raise ValueError(f"Invalid cookie value: {val}")
+
+
+def get_env_bool(key: str, default_val: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default_val
+    return val.lower() in ("1", "true", "yes")
+</file>
+
+<file path="twscrape/account.py">
+import json
+import os
+import sqlite3
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+
+from httpx import AsyncClient, AsyncHTTPTransport
+
+from .models import JSONTrait
+from .utils import utc
+
+TOKEN = "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+
+@dataclass
+class Account(JSONTrait):
+    username: str
+    password: str
+    email: str
+    email_password: str
+    user_agent: str
+    active: bool
+    locks: dict[str, datetime] = field(default_factory=dict)  # queue: datetime
+    stats: dict[str, int] = field(default_factory=dict)  # queue: requests
+    headers: dict[str, str] = field(default_factory=dict)
+    cookies: dict[str, str] = field(default_factory=dict)
+    mfa_code: str | None = None
+    proxy: str | None = None
+    error_msg: str | None = None
+    last_used: datetime | None = None
+    _tx: str | None = None
+
+    @staticmethod
+    def from_rs(rs: sqlite3.Row):
+        doc = dict(rs)
+        doc["locks"] = {k: utc.from_iso(v) for k, v in json.loads(doc["locks"]).items()}
+        doc["stats"] = {k: v for k, v in json.loads(doc["stats"]).items() if isinstance(v, int)}
+        doc["headers"] = json.loads(doc["headers"])
+        doc["cookies"] = json.loads(doc["cookies"])
+        doc["active"] = bool(doc["active"])
+        doc["last_used"] = utc.from_iso(doc["last_used"]) if doc["last_used"] else None
+        return Account(**doc)
+
+    def to_rs(self):
+        rs = asdict(self)
+        rs["locks"] = json.dumps(rs["locks"], default=lambda x: x.isoformat())
+        rs["stats"] = json.dumps(rs["stats"])
+        rs["headers"] = json.dumps(rs["headers"])
+        rs["cookies"] = json.dumps(rs["cookies"])
+        rs["last_used"] = rs["last_used"].isoformat() if rs["last_used"] else None
+        return rs
+
+    def make_client(self, proxy: str | None = None) -> AsyncClient:
+        proxies = [proxy, os.getenv("TWS_PROXY"), self.proxy]
+        proxies = [x for x in proxies if x is not None]
+        proxy = proxies[0] if proxies else None
+
+        transport = AsyncHTTPTransport(retries=3)
+        client = AsyncClient(proxy=proxy, follow_redirects=True, transport=transport)
+
+        # saved from previous usage
+        client.cookies.update(self.cookies)
+        client.headers.update(self.headers)
+
+        # default settings
+        client.headers["user-agent"] = self.user_agent
+        client.headers["content-type"] = "application/json"
+        client.headers["authorization"] = TOKEN
+        client.headers["x-twitter-active-user"] = "yes"
+        client.headers["x-twitter-client-language"] = "en"
+
+        if "ct0" in client.cookies:
+            client.headers["x-csrf-token"] = client.cookies["ct0"]
+
+        return client
+</file>
+
+<file path="twscrape/imap.py">
+import asyncio
+import email as emaillib
+import imaplib
+import os
+import time
+from datetime import datetime
+
+from .logger import logger
+
+
+def env_int(key: str | list[str], default: int) -> int:
+    key = [key] if isinstance(key, str) else key
+    val = [os.getenv(k) for k in key]
+    val = [int(x) for x in val if x is not None]
+    return val[0] if val else default
+
+
+TWS_WAIT_EMAIL_CODE = env_int(["TWS_WAIT_EMAIL_CODE", "LOGIN_CODE_TIMEOUT"], 30)
+
+
+class EmailLoginError(Exception):
+    def __init__(self, message="Email login error"):
+        self.message = message
+        super().__init__(self.message)
+
+
+class EmailCodeTimeoutError(Exception):
+    def __init__(self, message="Email code timeout"):
+        self.message = message
+        super().__init__(self.message)
+
+
+IMAP_MAPPING: dict[str, str] = {
+    "yahoo.com": "imap.mail.yahoo.com",
+    "icloud.com": "imap.mail.me.com",
+    "outlook.com": "imap-mail.outlook.com",
+    "hotmail.com": "imap-mail.outlook.com",
+}
+
+
+def add_imap_mapping(email_domain: str, imap_domain: str):
+    IMAP_MAPPING[email_domain] = imap_domain
+
+
+def _get_imap_domain(email: str) -> str:
+    email_domain = email.split("@")[1]
+    if email_domain in IMAP_MAPPING:
+        return IMAP_MAPPING[email_domain]
+    return f"imap.{email_domain}"
+
+
+def _wait_email_code(imap: imaplib.IMAP4_SSL, count: int, min_t: datetime | None) -> str | None:
+    for i in range(count, 0, -1):
+        _, rep = imap.fetch(str(i), "(RFC822)")
+        for x in rep:
+            if isinstance(x, tuple):
+                msg = emaillib.message_from_bytes(x[1])
+
+                # https://www.ietf.org/rfc/rfc9051.html#section-6.3.12-13
+                msg_time = msg.get("Date", "").split("(")[0].strip()
+                msg_time = datetime.strptime(msg_time, "%a, %d %b %Y %H:%M:%S %z")
+
+                msg_from = str(msg.get("From", "")).lower()
+                msg_subj = str(msg.get("Subject", "")).lower()
+                logger.info(f"({i} of {count}) {msg_from} - {msg_time} - {msg_subj}")
+
+                if min_t is not None and msg_time < min_t:
+                    return None
+
+                if "info@x.com" in msg_from and "confirmation code is" in msg_subj:
+                    # eg. Your Twitter confirmation code is XXX
+                    return msg_subj.split(" ")[-1].strip()
+
+    return None
+
+
+async def imap_get_email_code(
+    imap: imaplib.IMAP4_SSL, email: str, min_t: datetime | None = None
+) -> str:
+    try:
+        logger.info(f"Waiting for confirmation code for {email}...")
+        start_time = time.time()
+        while True:
+            _, rep = imap.select("INBOX")
+            msg_count = int(rep[0].decode("utf-8")) if len(rep) > 0 and rep[0] is not None else 0
+            code = _wait_email_code(imap, msg_count, min_t)
+            if code is not None:
+                return code
+
+            if TWS_WAIT_EMAIL_CODE < time.time() - start_time:
+                raise EmailCodeTimeoutError(f"Email code timeout ({TWS_WAIT_EMAIL_CODE} sec)")
+
+            await asyncio.sleep(5)
+    except Exception as e:
+        imap.select("INBOX")
+        imap.close()
+        raise e
+
+
+async def imap_login(email: str, password: str):
+    domain = _get_imap_domain(email)
+    imap = imaplib.IMAP4_SSL(domain)
+
+    try:
+        imap.login(email, password)
+        imap.select("INBOX", readonly=True)
+    except imaplib.IMAP4.error as e:
+        logger.error(f"Error logging into {email} on {domain}: {e}")
+        raise EmailLoginError() from e
+
+    return imap
+</file>
+
+<file path="_get_gql_ops.py">
+import asyncio
+import os
+import re
+
+import httpx
+
+from twscrape.xclid import get_scripts_list, get_tw_page_text, script_url
+
+
+async def get_scripts():
+    cache_dir = "/tmp/twscrape-ops"
+    os.makedirs(cache_dir, exist_ok=True)
+
+    text = await get_tw_page_text("https://x.com/elonmusk")
+    urls = list(get_scripts_list(text))
+
+    v = text.split("/client-web/main.")[1].split(".")[0]
+    urls.append(script_url("main", v))
+
+    urls = [
+        x
+        for x in urls
+        if "/i18n/" not in x and "/icons/" not in x and "react-syntax-highlighter" not in x
+    ]
+
+    scripts = []
+    for i, x in enumerate(urls, 1):
+        cache_path = os.path.join(cache_dir, x.split("/")[-1].split("?")[0])
+        if os.path.exists(cache_path):
+            with open(cache_path) as fp:
+                scripts.append(fp.read())
+            continue
+
+        print(f"({i:3d} / {len(urls):3d}) {x}")
+        rep = await httpx.AsyncClient().get(x)
+        rep.raise_for_status()
+
+        with open(cache_path, "w") as fp:
+            fp.write(rep.text)
+        scripts.append(rep.text)
+
+    return scripts
+
+
+async def main():
+    with open("./twscrape/api.py") as fp:
+        ops = [x.strip() for x in fp.read().split("\n")]
+        ops = [x.split("=")[0].removeprefix("OP_").strip() for x in ops if x.startswith("OP_")]
+
+    all_pairs = {}
+    for txt in await get_scripts():
+        pairs = re.findall(r'queryId:"(.+?)".+?operationName:"(.+?)"', txt)
+        pairs = {op_name: op_id for op_id, op_name in pairs}
+
+        for k, v in pairs.items():
+            if k in all_pairs and v != all_pairs[k]:
+                print(f"DIFF: {k} = {v} != {all_pairs[k]}")
+
+            all_pairs[k] = v
+
+    for k, v in all_pairs.items():
+        print(f'OP_{k} = "{v}/{k}"')
+
+    print("-" * 40)
+
+    for x in ops:
+        print(f'OP_{x} = "{all_pairs.get(x, "???")}/{x}"')
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+</file>
+
+<file path="twscrape/accounts_pool.py">
+import asyncio
+import sqlite3
+import uuid
+from datetime import datetime, timezone
+from typing import TypedDict
+
+from fake_useragent import UserAgent
+from httpx import HTTPStatusError
+
+from .account import Account
+from .db import execute, fetchall, fetchone
+from .logger import logger
+from .login import LoginConfig, login
+from .utils import get_env_bool, parse_cookies, utc
+
+
+class NoAccountError(Exception):
+    pass
+
+
+class AccountInfo(TypedDict):
+    username: str
+    logged_in: bool
+    active: bool
+    last_used: datetime | None
+    total_req: int
+    error_msg: str | None
+
+
+def guess_delim(line: str):
+    lp, rp = tuple([x.strip() for x in line.split("username")])
+    return rp[0] if not lp else lp[-1]
+
+
+class AccountsPool:
+    # _order_by: str = "RANDOM()"
+    _order_by: str = "username"
+
+    def __init__(
+        self,
+        db_file="accounts.db",
+        login_config: LoginConfig | None = None,
+        raise_when_no_account=False,
+    ):
+        self._db_file = db_file
+        self._login_config = login_config or LoginConfig()
+        self._raise_when_no_account = raise_when_no_account
+
+    async def load_from_file(self, filepath: str, line_format: str):
+        line_delim = guess_delim(line_format)
+        tokens = line_format.split(line_delim)
+
+        required = set(["username", "password", "email", "email_password"])
+        if not required.issubset(tokens):
+            raise ValueError(f"Invalid line format: {line_format}")
+
+        accounts = []
+        with open(filepath, "r") as f:
+            lines = f.read().split("\n")
+            lines = [x.strip() for x in lines if x.strip()]
+
+            for line in lines:
+                data = [x.strip() for x in line.split(line_delim)]
+                if len(data) < len(tokens):
+                    raise ValueError(f"Invalid line: {line}")
+
+                data = data[: len(tokens)]
+                vals = {k: v for k, v in zip(tokens, data) if k != "_"}
+                accounts.append(vals)
+
+        for x in accounts:
+            await self.add_account(**x)
+
+    async def add_account(
+        self,
+        username: str,
+        password: str,
+        email: str,
+        email_password: str,
+        user_agent: str | None = None,
+        proxy: str | None = None,
+        cookies: str | None = None,
+        mfa_code: str | None = None,
+    ):
+        qs = "SELECT * FROM accounts WHERE username = :username"
+        rs = await fetchone(self._db_file, qs, {"username": username})
+        if rs:
+            logger.warning(f"Account {username} already exists")
+            return
+
+        account = Account(
+            username=username,
+            password=password,
+            email=email,
+            email_password=email_password,
+            user_agent=user_agent or UserAgent().safari,
+            active=False,
+            locks={},
+            stats={},
+            headers={},
+            cookies=parse_cookies(cookies) if cookies else {},
+            proxy=proxy,
+            mfa_code=mfa_code,
+        )
+
+        if "ct0" in account.cookies:
+            account.active = True
+
+        await self.save(account)
+        logger.info(f"Account {username} added successfully (active={account.active})")
+
+    async def delete_accounts(self, usernames: str | list[str]):
+        usernames = usernames if isinstance(usernames, list) else [usernames]
+        usernames = list(set(usernames))
+        if not usernames:
+            logger.warning("No usernames provided")
+            return
+
+        qs = f"""DELETE FROM accounts WHERE username IN ({",".join([f'"{x}"' for x in usernames])})"""
+        await execute(self._db_file, qs)
+
+    async def delete_inactive(self):
+        qs = "DELETE FROM accounts WHERE active = false"
+        await execute(self._db_file, qs)
+
+    async def get(self, username: str):
+        qs = "SELECT * FROM accounts WHERE username = :username"
+        rs = await fetchone(self._db_file, qs, {"username": username})
+        if not rs:
+            raise ValueError(f"Account {username} not found")
+        return Account.from_rs(rs)
+
+    async def get_all(self):
+        qs = "SELECT * FROM accounts"
+        rs = await fetchall(self._db_file, qs)
+        return [Account.from_rs(x) for x in rs]
+
+    async def get_account(self, username: str):
+        qs = "SELECT * FROM accounts WHERE username = :username"
+        rs = await fetchone(self._db_file, qs, {"username": username})
+        if not rs:
+            return None
+        return Account.from_rs(rs)
+
+    async def save(self, account: Account):
+        data = account.to_rs()
+        cols = list(data.keys())
+
+        qs = f"""
+        INSERT INTO accounts ({",".join(cols)}) VALUES ({",".join([f":{x}" for x in cols])})
+        ON CONFLICT(username) DO UPDATE SET {",".join([f"{x}=excluded.{x}" for x in cols])}
+        """
+        await execute(self._db_file, qs, data)
+
+    async def login(self, account: Account):
+        try:
+            await login(account, cfg=self._login_config)
+            logger.info(f"Logged in to {account.username} successfully")
+            return True
+        except HTTPStatusError as e:
+            rep = e.response
+            logger.error(f"Failed to login '{account.username}': {rep.status_code} - {rep.text}")
+            return False
+        except Exception as e:
+            logger.error(f"Failed to login '{account.username}': {e}")
+            return False
+        finally:
+            await self.save(account)
+
+    async def login_all(self, usernames: list[str] | None = None):
+        if usernames is None:
+            qs = "SELECT * FROM accounts WHERE active = false AND error_msg IS NULL"
+        else:
+            us = ",".join([f'"{x}"' for x in usernames])
+            qs = f"SELECT * FROM accounts WHERE username IN ({us})"
+
+        rs = await fetchall(self._db_file, qs)
+        accounts = [Account.from_rs(rs) for rs in rs]
+        # await asyncio.gather(*[login(x) for x in self.accounts])
+
+        counter = {"total": len(accounts), "success": 0, "failed": 0}
+        for i, x in enumerate(accounts, start=1):
+            logger.info(f"[{i}/{len(accounts)}] Logging in {x.username} - {x.email}")
+            status = await self.login(x)
+            counter["success" if status else "failed"] += 1
+        return counter
+
+    async def relogin(self, usernames: str | list[str]):
+        usernames = usernames if isinstance(usernames, list) else [usernames]
+        usernames = list(set(usernames))
+        if not usernames:
+            logger.warning("No usernames provided")
+            return
+
+        qs = f"""
+        UPDATE accounts SET
+            active = false,
+            locks = json_object(),
+            last_used = NULL,
+            error_msg = NULL,
+            headers = json_object(),
+            cookies = json_object(),
+            user_agent = "{UserAgent().safari}"
+        WHERE username IN ({",".join([f'"{x}"' for x in usernames])})
+        """
+
+        await execute(self._db_file, qs)
+        await self.login_all(usernames)
+
+    async def relogin_failed(self):
+        qs = "SELECT username FROM accounts WHERE active = false AND error_msg IS NOT NULL"
+        rs = await fetchall(self._db_file, qs)
+        await self.relogin([x["username"] for x in rs])
+
+    async def reset_locks(self):
+        qs = "UPDATE accounts SET locks = json_object()"
+        await execute(self._db_file, qs)
+
+    async def set_active(self, username: str, active: bool):
+        qs = "UPDATE accounts SET active = :active WHERE username = :username"
+        await execute(self._db_file, qs, {"username": username, "active": active})
+
+    async def lock_until(self, username: str, queue: str, unlock_at: int, req_count=0):
+        qs = f"""
+        UPDATE accounts SET
+            locks = json_set(locks, '$.{queue}', datetime({unlock_at}, 'unixepoch')),
+            stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
+            last_used = datetime({utc.ts()}, 'unixepoch')
+        WHERE username = :username
+        """
+        await execute(self._db_file, qs, {"username": username})
+
+    async def unlock(self, username: str, queue: str, req_count=0):
+        qs = f"""
+        UPDATE accounts SET
+            locks = json_remove(locks, '$.{queue}'),
+            stats = json_set(stats, '$.{queue}', COALESCE(json_extract(stats, '$.{queue}'), 0) + {req_count}),
+            last_used = datetime({utc.ts()}, 'unixepoch')
+        WHERE username = :username
+        """
+        await execute(self._db_file, qs, {"username": username})
+
+    async def _get_and_lock(self, queue: str, condition: str):
+        # if space in condition, it's a subquery, otherwise it's username
+        condition = f"({condition})" if " " in condition else f"'{condition}'"
+
+        if int(sqlite3.sqlite_version_info[1]) >= 35:
+            qs = f"""
+            UPDATE accounts SET
+                locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
+                last_used = datetime({utc.ts()}, 'unixepoch')
+            WHERE username = {condition}
+            RETURNING *
+            """
+            rs = await fetchone(self._db_file, qs)
+        else:
+            tx = uuid.uuid4().hex
+            qs = f"""
+            UPDATE accounts SET
+                locks = json_set(locks, '$.{queue}', datetime('now', '+15 minutes')),
+                last_used = datetime({utc.ts()}, 'unixepoch'),
+                _tx = '{tx}'
+            WHERE username = {condition}
+            """
+            await execute(self._db_file, qs)
+
+            qs = f"SELECT * FROM accounts WHERE _tx = '{tx}'"
+            rs = await fetchone(self._db_file, qs)
+
+        return Account.from_rs(rs) if rs else None
+
+    async def get_for_queue(self, queue: str):
+        q = f"""
+        SELECT username FROM accounts
+        WHERE active = true AND (
+            locks IS NULL
+            OR json_extract(locks, '$.{queue}') IS NULL
+            OR json_extract(locks, '$.{queue}') < datetime('now')
+        )
+        ORDER BY {self._order_by}
+        LIMIT 1
+        """
+
+        return await self._get_and_lock(queue, q)
+
+    async def get_for_queue_or_wait(self, queue: str) -> Account | None:
+        msg_shown = False
+        while True:
+            account = await self.get_for_queue(queue)
+            if not account:
+                if self._raise_when_no_account or get_env_bool("TWS_RAISE_WHEN_NO_ACCOUNT"):
+                    raise NoAccountError(f"No account available for queue {queue}")
+
+                if not msg_shown:
+                    nat = await self.next_available_at(queue)
+                    if not nat:
+                        logger.warning("No active accounts. Stopping...")
+                        return None
+
+                    msg = f'No account available for queue "{queue}". Next available at {nat}'
+                    logger.info(msg)
+                    msg_shown = True
+
+                await asyncio.sleep(5)
+                continue
+            else:
+                if msg_shown:
+                    logger.info(f"Continuing with account {account.username} on queue {queue}")
+
+            return account
+
+    async def next_available_at(self, queue: str):
+        qs = f"""
+        SELECT json_extract(locks, '$."{queue}"') as lock_until
+        FROM accounts
+        WHERE active = true AND json_extract(locks, '$."{queue}"') IS NOT NULL
+        ORDER BY lock_until ASC
+        LIMIT 1
+        """
+        rs = await fetchone(self._db_file, qs)
+        if rs:
+            now, trg = utc.now(), utc.from_iso(rs[0])
+            if trg < now:
+                return "now"
+
+            at_local = datetime.now() + (trg - now)
+            return at_local.strftime("%H:%M:%S")
+
+        return None
+
+    async def mark_inactive(self, username: str, error_msg: str | None):
+        qs = """
+        UPDATE accounts SET active = false, error_msg = :error_msg
+        WHERE username = :username
+        """
+        await execute(self._db_file, qs, {"username": username, "error_msg": error_msg})
+
+    async def stats(self):
+        def locks_count(queue: str):
+            return f"""
+            SELECT COUNT(*) FROM accounts
+            WHERE json_extract(locks, '$.{queue}') IS NOT NULL
+                AND json_extract(locks, '$.{queue}') > datetime('now')
+            """
+
+        qs = "SELECT DISTINCT(f.key) as k from accounts, json_each(locks) f"
+        rs = await fetchall(self._db_file, qs)
+        gql_ops = [x["k"] for x in rs]
+
+        config = [
+            ("total", "SELECT COUNT(*) FROM accounts"),
+            ("active", "SELECT COUNT(*) FROM accounts WHERE active = true"),
+            ("inactive", "SELECT COUNT(*) FROM accounts WHERE active = false"),
+            *[(f"locked_{x}", locks_count(x)) for x in gql_ops],
+        ]
+
+        qs = f"SELECT {','.join([f'({q}) as {k}' for k, q in config])}"
+        rs = await fetchone(self._db_file, qs)
+        return dict(rs) if rs else {}
+
+    async def accounts_info(self):
+        accounts = await self.get_all()
+
+        items: list[AccountInfo] = []
+        for x in accounts:
+            item: AccountInfo = {
+                "username": x.username,
+                "logged_in": (x.headers or {}).get("authorization", "") != "",
+                "active": x.active,
+                "last_used": x.last_used,
+                "total_req": sum(x.stats.values()),
+                "error_msg": str(x.error_msg)[0:60],
+            }
+            items.append(item)
+
+        old_time = datetime(1970, 1, 1).replace(tzinfo=timezone.utc)
+        items = sorted(items, key=lambda x: x["username"].lower())
+        items = sorted(
+            items,
+            key=lambda x: x["last_used"] or old_time if x["total_req"] > 0 else old_time,
+            reverse=True,
+        )
+        items = sorted(items, key=lambda x: x["active"], reverse=True)
+        # items = sorted(items, key=lambda x: x["total_req"], reverse=True)
+        return items
+</file>
+
+<file path="twscrape/login.py">
+import imaplib
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import Any
+
+import pyotp
+from httpx import AsyncClient, Response
+
+from .account import Account
+from .imap import imap_get_email_code, imap_login
+from .logger import logger
+from .utils import utc
+
+LOGIN_URL = "https://api.x.com/1.1/onboarding/task.json"
+
+
+@dataclass
+class LoginConfig:
+    email_first: bool = False
+    manual: bool = False
+
+
+@dataclass
+class TaskCtx:
+    client: AsyncClient
+    acc: Account
+    cfg: LoginConfig
+    prev: Any
+    imap: None | imaplib.IMAP4_SSL
+
+
+async def get_guest_token(client: AsyncClient):
+    rep = await client.post("https://api.x.com/1.1/guest/activate.json")
+    rep.raise_for_status()
+    return rep.json()["guest_token"]
+
+
+async def login_initiate(client: AsyncClient) -> Response:
+    payload = {
+        "input_flow_data": {
+            "flow_context": {"debug_overrides": {}, "start_location": {"location": "unknown"}}
+        },
+        "subtask_versions": {},
+    }
+
+    rep = await client.post(LOGIN_URL, params={"flow_name": "login"}, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_alternate_identifier(ctx: TaskCtx, *, username: str) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginEnterAlternateIdentifierSubtask",
+                "enter_text": {"text": username, "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_instrumentation(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginJsInstrumentationSubtask",
+                "js_instrumentation": {"response": "{}", "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_enter_username(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginEnterUserIdentifierSSO",
+                "settings_list": {
+                    "setting_responses": [
+                        {
+                            "key": "user_identifier",
+                            "response_data": {"text_data": {"result": ctx.acc.username}},
+                        }
+                    ],
+                    "link": "next_link",
+                },
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_enter_password(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginEnterPassword",
+                "enter_password": {"password": ctx.acc.password, "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_two_factor_auth_challenge(ctx: TaskCtx) -> Response:
+    if ctx.acc.mfa_code is None:
+        raise ValueError("MFA code is required")
+
+    totp = pyotp.TOTP(ctx.acc.mfa_code)
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginTwoFactorAuthChallenge",
+                "enter_text": {"text": totp.now(), "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_duplication_check(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "AccountDuplicationCheck",
+                "check_logged_in_account": {"link": "AccountDuplicationCheck_false"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_confirm_email(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginAcid",
+                "enter_text": {"text": ctx.acc.email, "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_confirm_email_code(ctx: TaskCtx):
+    if ctx.cfg.manual:
+        print(f"Enter email code for {ctx.acc.username} / {ctx.acc.email}")
+        value = input("Code: ")
+        value = value.strip()
+    else:
+        if not ctx.imap:
+            ctx.imap = await imap_login(ctx.acc.email, ctx.acc.email_password)
+
+        now_time = utc.now() - timedelta(seconds=30)
+        value = await imap_get_email_code(ctx.imap, ctx.acc.email, now_time)
+
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [
+            {
+                "subtask_id": "LoginAcid",
+                "enter_text": {"text": value, "link": "next_link"},
+            }
+        ],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def login_success(ctx: TaskCtx) -> Response:
+    payload = {
+        "flow_token": ctx.prev["flow_token"],
+        "subtask_inputs": [],
+    }
+
+    rep = await ctx.client.post(LOGIN_URL, json=payload)
+    rep.raise_for_status()
+    return rep
+
+
+async def next_login_task(ctx: TaskCtx, rep: Response):
+    ct0 = ctx.client.cookies.get("ct0", None)
+    if ct0:
+        ctx.client.headers["x-csrf-token"] = ct0
+        ctx.client.headers["x-twitter-auth-type"] = "OAuth2Session"
+
+    ctx.prev = rep.json()
+    assert "flow_token" in ctx.prev, f"flow_token not in {rep.text}"
+
+    for x in ctx.prev["subtasks"]:
+        task_id = x["subtask_id"]
+
+        try:
+            if task_id == "LoginSuccessSubtask":
+                return await login_success(ctx)
+            if task_id == "LoginAcid":
+                is_code = x["enter_text"]["hint_text"].lower() == "confirmation code"
+                fn = login_confirm_email_code if is_code else login_confirm_email
+                return await fn(ctx)
+            if task_id == "AccountDuplicationCheck":
+                return await login_duplication_check(ctx)
+            if task_id == "LoginEnterPassword":
+                return await login_enter_password(ctx)
+            if task_id == "LoginTwoFactorAuthChallenge":
+                return await login_two_factor_auth_challenge(ctx)
+            if task_id == "LoginEnterUserIdentifierSSO":
+                return await login_enter_username(ctx)
+            if task_id == "LoginJsInstrumentationSubtask":
+                return await login_instrumentation(ctx)
+            if task_id == "LoginEnterAlternateIdentifierSubtask":
+                return await login_alternate_identifier(ctx, username=ctx.acc.username)
+        except Exception as e:
+            ctx.acc.error_msg = f"login_step={task_id} err={e}"
+            raise e
+
+    return None
+
+
+async def login(acc: Account, cfg: LoginConfig | None = None) -> Account:
+    log_id = f"{acc.username} - {acc.email}"
+    if acc.active:
+        logger.info(f"account already active {log_id}")
+        return acc
+
+    cfg, imap = cfg or LoginConfig(), None
+    if cfg.email_first and not cfg.manual:
+        imap = await imap_login(acc.email, acc.email_password)
+
+    async with acc.make_client() as client:
+        guest_token = await get_guest_token(client)
+        client.headers["x-guest-token"] = guest_token
+
+        rep = await login_initiate(client)
+        ctx = TaskCtx(client, acc, cfg, None, imap)
+        while True:
+            rep = await next_login_task(ctx, rep)
+            if not rep:
+                break
+
+        assert "ct0" in client.cookies, "ct0 not in cookies (most likely ip ban)"
+        client.headers["x-csrf-token"] = client.cookies["ct0"]
+        client.headers["x-twitter-auth-type"] = "OAuth2Session"
+
+        acc.active = True
+        acc.headers = {k: v for k, v in client.headers.items()}
+        acc.cookies = {k: v for k, v in client.cookies.items()}
+        return acc
+</file>
+
+<file path="twscrape/cli.py">
+#!/usr/bin/env python3
+
+import argparse
+import asyncio
+import io
+import json
+import sqlite3
+from importlib.metadata import version
+
+import httpx
+
+from .api import API, AccountsPool
+from .db import get_sqlite_version
+from .logger import logger, set_log_level
+from .login import LoginConfig
+from .models import Tweet, User
+from .utils import print_table
+
+
+class CustomHelpFormatter(argparse.HelpFormatter):
+    def __init__(self, prog):
+        super().__init__(prog, max_help_position=30, width=120)
+
+
+def get_fn_arg(args):
+    names = ["query", "tweet_id", "user_id", "username", "list_id", "trend_id"]
+    for name in names:
+        if name in args:
+            return name, getattr(args, name)
+
+    logger.error(f"Missing argument: {names}")
+    exit(1)
+
+
+def to_str(doc: httpx.Response | Tweet | User | None) -> str:
+    if doc is None:
+        return "Not Found. See --raw for more details."
+
+    tmp = doc.json()
+    return tmp if isinstance(tmp, str) else json.dumps(tmp, default=str)
+
+
+async def main(args):
+    if args.debug:
+        set_log_level("DEBUG")
+
+    if args.command == "version":
+        print(f"twscrape: {version('twscrape')}")
+        print(f"SQLite runtime: {sqlite3.sqlite_version} ({await get_sqlite_version()})")
+        return
+
+    login_config = LoginConfig(getattr(args, "email_first", False), getattr(args, "manual", False))
+    pool = AccountsPool(args.db, login_config=login_config)
+    api = API(pool, debug=args.debug)
+
+    if args.command == "accounts":
+        print_table([dict(x) for x in await pool.accounts_info()])
+        return
+
+    if args.command == "stats":
+        rep = await pool.stats()
+        total, active, inactive = rep["total"], rep["active"], rep["inactive"]
+
+        res = []
+        for k, v in rep.items():
+            if not k.startswith("locked") or v == 0:
+                continue
+            res.append({"queue": k, "locked": v, "available": max(active - v, 0)})
+
+        res = sorted(res, key=lambda x: x["locked"], reverse=True)
+        print_table(res, hr_after=True)
+        print(f"Total: {total} - Active: {active} - Inactive: {inactive}")
+        return
+
+    if args.command == "add_accounts":
+        await pool.load_from_file(args.file_path, args.line_format)
+        print("\nNow run:\ntwscrape login_accounts")
+        return
+
+    if args.command == "del_accounts":
+        await pool.delete_accounts(args.usernames)
+        return
+
+    if args.command == "login_accounts":
+        stats = await pool.login_all()
+        print(stats)
+        return
+
+    if args.command == "relogin_failed":
+        await pool.relogin_failed()
+        return
+
+    if args.command == "relogin":
+        await pool.relogin(args.usernames)
+        return
+
+    if args.command == "reset_locks":
+        await pool.reset_locks()
+        return
+
+    if args.command == "delete_inactive":
+        await pool.delete_inactive()
+        return
+
+    fn = args.command + "_raw" if args.raw else args.command
+    fn = getattr(api, fn, None)
+    if fn is None:
+        logger.error(f"Unknown command: {args.command}")
+        exit(1)
+
+    _, val = get_fn_arg(args)
+
+    if "limit" in args:
+        async for doc in fn(val, limit=args.limit):
+            print(to_str(doc))
+    else:
+        doc = await fn(val)
+        print(to_str(doc))
+
+
+def custom_help(p):
+    buffer = io.StringIO()
+    p.print_help(buffer)
+    msg = buffer.getvalue()
+
+    cmd = msg.split("positional arguments:")[1].strip().split("\n")[0]
+    msg = msg.replace("positional arguments:", "commands:")
+    msg = [x for x in msg.split("\n") if cmd not in x and "..." not in x]
+    msg[0] = f"{msg[0]} <command> [...]"
+
+    i = 0
+    for i, line in enumerate(msg):
+        if line.strip().startswith("search"):
+            break
+
+    msg.insert(i, "")
+    msg.insert(i + 1, "search commands:")
+
+    print("\n".join(msg))
+
+
+def run():
+    p = argparse.ArgumentParser(add_help=False, formatter_class=CustomHelpFormatter)
+    p.add_argument("--db", default="accounts.db", help="Accounts database file")
+    p.add_argument("--debug", action="store_true", help="Enable debug mode")
+    subparsers = p.add_subparsers(dest="command")
+
+    def c_one(name: str, msg: str, a_name: str, a_msg: str, a_type: type = str):
+        p = subparsers.add_parser(name, help=msg)
+        p.add_argument(a_name, help=a_msg, type=a_type)
+        p.add_argument("--raw", action="store_true", help="Print raw response")
+        return p
+
+    def c_lim(name: str, msg: str, a_name: str, a_msg: str, a_type: type = str):
+        p = c_one(name, msg, a_name, a_msg, a_type)
+        p.add_argument("--limit", type=int, default=-1, help="Max tweets to retrieve")
+        return p
+
+    subparsers.add_parser("version", help="Show version")
+    subparsers.add_parser("accounts", help="List all accounts")
+    subparsers.add_parser("stats", help="Get current usage stats")
+
+    add_accounts = subparsers.add_parser("add_accounts", help="Add accounts")
+    add_accounts.add_argument("file_path", help="File with accounts")
+    add_accounts.add_argument("line_format", help="args of Pool.add_account splited by same delim")
+
+    del_accounts = subparsers.add_parser("del_accounts", help="Delete accounts")
+    del_accounts.add_argument("usernames", nargs="+", default=[], help="Usernames to delete")
+
+    login_cmd = subparsers.add_parser("login_accounts", help="Login accounts")
+    relogin = subparsers.add_parser("relogin", help="Re-login selected accounts")
+    relogin.add_argument("usernames", nargs="+", default=[], help="Usernames to re-login")
+    re_failed = subparsers.add_parser("relogin_failed", help="Retry login for failed accounts")
+
+    login_commands = [login_cmd, relogin, re_failed]
+    for cmd in login_commands:
+        cmd.add_argument("--email-first", action="store_true", help="Check email first")
+        cmd.add_argument("--manual", action="store_true", help="Enter email code manually")
+
+    subparsers.add_parser("reset_locks", help="Reset all locks")
+    subparsers.add_parser("delete_inactive", help="Delete inactive accounts")
+
+    c_lim("search", "Search for tweets", "query", "Search query")
+    c_one("tweet_details", "Get tweet details", "tweet_id", "Tweet ID", int)
+    c_lim("tweet_replies", "Get replies  of a tweet", "tweet_id", "Tweet ID", int)
+    c_lim("retweeters", "Get retweeters of a tweet", "tweet_id", "Tweet ID", int)
+    c_one("user_by_id", "Get user data by ID", "user_id", "User ID", int)
+    c_one("user_by_login", "Get user data by username", "username", "Username")
+    c_lim("following", "Get user following", "user_id", "User ID", int)
+    c_lim("followers", "Get user followers", "user_id", "User ID", int)
+    # https://x.com/xDaily/status/1701694747767648500
+    c_lim("verified_followers", "Get user verified followers", "user_id", "User ID", int)
+    c_lim("subscriptions", "Get user subscriptions", "user_id", "User ID", int)
+    c_lim("user_tweets", "Get user tweets", "user_id", "User ID", int)
+    c_lim("user_tweets_and_replies", "Get user tweets and replies", "user_id", "User ID", int)
+    c_lim("user_media", "Get user's media", "user_id", "User ID", int)
+    c_lim("list_timeline", "Get tweets from list", "list_id", "List ID", int)
+    c_lim("trends", "Get trends", "trend_id", "Trend ID or name", str)
+
+    args = p.parse_args()
+    if args.command is None:
+        return custom_help(p)
+
+    try:
+        asyncio.run(main(args))
+    except KeyboardInterrupt:
+        pass
+</file>
+
+<file path="twscrape/models.py">
+import email.utils
+import json
+import os
+import random
+import re
+import string
+import sys
+import traceback
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from typing import Generator, Optional, Union
+
+import httpx
+
+from .logger import logger
+from .utils import find_item, get_or, int_or, to_old_rep, utc
+
+
+@dataclass
+class JSONTrait:
+    def dict(self):
+        return asdict(self)
+
+    def json(self):
+        return json.dumps(self.dict(), default=str)
+
+
+@dataclass
+class Coordinates(JSONTrait):
+    longitude: float
+    latitude: float
+
+    @staticmethod
+    def parse(tw_obj: dict):
+        if tw_obj.get("coordinates"):
+            coords = tw_obj["coordinates"]["coordinates"]
+            return Coordinates(coords[0], coords[1])
+        if tw_obj.get("geo"):
+            coords = tw_obj["geo"]["coordinates"]
+            return Coordinates(coords[1], coords[0])
+        return None
+
+
+@dataclass
+class Place(JSONTrait):
+    id: str
+    fullName: str
+    name: str
+    type: str
+    country: str
+    countryCode: str
+
+    @staticmethod
+    def parse(obj: dict):
+        return Place(
+            id=obj["id"],
+            fullName=obj["full_name"],
+            name=obj["name"],
+            type=obj["place_type"],
+            country=obj["country"],
+            countryCode=obj["country_code"],
+        )
+
+
+@dataclass
+class TextLink(JSONTrait):
+    url: str
+    text: str | None
+    tcourl: str | None
+
+    @staticmethod
+    def parse(obj: dict):
+        url1 = obj.get("expanded_url", None)
+        url2 = obj.get("url", None)
+        text = obj.get("display_url", None)
+
+        if not isinstance(url1, str) or not isinstance(url2, str):
+            return None
+
+        return TextLink(url=url1, text=text, tcourl=url2)
+
+
+@dataclass
+class UserRef(JSONTrait):
+    id: int
+    id_str: str
+    username: str
+    displayname: str
+    _type: str = "snscrape.modules.twitter.UserRef"
+
+    @staticmethod
+    def parse(obj: dict):
+        return UserRef(
+            id=int(obj["id_str"]),
+            id_str=obj["id_str"],
+            username=obj["screen_name"],
+            displayname=obj["name"],
+        )
+
+
+@dataclass
+class User(JSONTrait):
+    id: int
+    id_str: str
+    url: str
+    username: str
+    displayname: str
+    rawDescription: str
+    created: datetime
+    followersCount: int
+    friendsCount: int
+    statusesCount: int
+    favouritesCount: int
+    listedCount: int
+    mediaCount: int
+    location: str
+    profileImageUrl: str
+    profileBannerUrl: str | None = None
+    protected: bool | None = None
+    verified: bool | None = None
+    blue: bool | None = None
+    blueType: str | None = None
+    descriptionLinks: list[TextLink] = field(default_factory=list)
+    pinnedIds: list[int] = field(default_factory=list)
+    _type: str = "snscrape.modules.twitter.User"
+
+    # todo:
+    # link: typing.Optional[TextLink] = None
+    # label: typing.Optional["UserLabel"] = None
+
+    @staticmethod
+    def parse(obj: dict, res=None):
+        return User(
+            id=int(obj["id_str"]),
+            id_str=obj["id_str"],
+            url=f"https://x.com/{obj['screen_name']}",
+            username=obj["screen_name"],
+            displayname=obj["name"],
+            rawDescription=obj["description"],
+            created=email.utils.parsedate_to_datetime(obj["created_at"]),
+            followersCount=obj["followers_count"],
+            friendsCount=obj["friends_count"],
+            statusesCount=obj["statuses_count"],
+            favouritesCount=obj["favourites_count"],
+            listedCount=obj["listed_count"],
+            mediaCount=obj["media_count"],
+            location=obj["location"],
+            profileImageUrl=obj["profile_image_url_https"],
+            profileBannerUrl=obj.get("profile_banner_url"),
+            verified=obj.get("verified"),
+            blue=obj.get("is_blue_verified"),
+            blueType=obj.get("verified_type"),
+            protected=obj.get("protected"),
+            descriptionLinks=_parse_links(obj, ["entities.description.urls", "entities.url.urls"]),
+            pinnedIds=[int(x) for x in obj.get("pinned_tweet_ids_str", [])],
+        )
+
+
+@dataclass
+class Tweet(JSONTrait):
+    id: int
+    id_str: str
+    url: str
+    date: datetime
+    user: User
+    lang: str
+    rawContent: str
+    replyCount: int
+    retweetCount: int
+    likeCount: int
+    quoteCount: int
+    bookmarkedCount: int
+    conversationId: int
+    conversationIdStr: str
+    hashtags: list[str]
+    cashtags: list[str]
+    mentionedUsers: list[UserRef]
+    links: list[TextLink]
+    media: "Media"
+    viewCount: int | None = None
+    retweetedTweet: Optional["Tweet"] = None
+    quotedTweet: Optional["Tweet"] = None
+    place: Optional[Place] = None
+    coordinates: Optional[Coordinates] = None
+    inReplyToTweetId: int | None = None
+    inReplyToTweetIdStr: str | None = None
+    inReplyToUser: UserRef | None = None
+    source: str | None = None
+    sourceUrl: str | None = None
+    sourceLabel: str | None = None
+    card: Union[None, "SummaryCard", "PollCard", "BroadcastCard", "AudiospaceCard"] = None
+    possibly_sensitive: bool | None = None
+    _type: str = "snscrape.modules.twitter.Tweet"
+
+    # todo:
+    # renderedContent: str
+    # vibe: Optional["Vibe"] = None
+
+    @staticmethod
+    def parse(obj: dict, res: dict):
+        tw_usr = User.parse(res["users"][obj["user_id_str"]])
+
+        rt_id_path = [
+            "retweeted_status_id_str",
+            "retweeted_status_result.result.rest_id",
+            "retweeted_status_result.result.tweet.rest_id",
+        ]
+
+        qt_id_path = [
+            "quoted_status_id_str",
+            "quoted_status_result.result.rest_id",
+            "quoted_status_result.result.tweet.rest_id",
+        ]
+
+        rt_obj = get_or(res, f"tweets.{_first(obj, rt_id_path)}")
+        qt_obj = get_or(res, f"tweets.{_first(obj, qt_id_path)}")
+
+        url = f"https://x.com/{tw_usr.username}/status/{obj['id_str']}"
+        doc = Tweet(
+            id=int(obj["id_str"]),
+            id_str=obj["id_str"],
+            url=url,
+            date=email.utils.parsedate_to_datetime(obj["created_at"]),
+            user=tw_usr,
+            lang=obj["lang"],
+            rawContent=get_or(obj, "note_tweet.note_tweet_results.result.text", obj["full_text"]),
+            replyCount=obj["reply_count"],
+            retweetCount=obj["retweet_count"],
+            likeCount=obj["favorite_count"],
+            quoteCount=obj["quote_count"],
+            bookmarkedCount=get_or(obj, "bookmark_count", 0),
+            conversationId=int(obj["conversation_id_str"]),
+            conversationIdStr=obj["conversation_id_str"],
+            hashtags=[x["text"] for x in get_or(obj, "entities.hashtags", [])],
+            cashtags=[x["text"] for x in get_or(obj, "entities.symbols", [])],
+            mentionedUsers=[UserRef.parse(x) for x in get_or(obj, "entities.user_mentions", [])],
+            links=_parse_links(
+                obj, ["entities.urls", "note_tweet.note_tweet_results.result.entity_set.urls"]
+            ),
+            viewCount=_get_views(obj, rt_obj or {}),
+            retweetedTweet=Tweet.parse(rt_obj, res) if rt_obj else None,
+            quotedTweet=Tweet.parse(qt_obj, res) if qt_obj else None,
+            place=Place.parse(obj["place"]) if obj.get("place") else None,
+            coordinates=Coordinates.parse(obj),
+            inReplyToTweetId=int_or(obj, "in_reply_to_status_id_str"),
+            inReplyToTweetIdStr=get_or(obj, "in_reply_to_status_id_str"),
+            inReplyToUser=_get_reply_user(obj, res),
+            source=obj.get("source", None),
+            sourceUrl=_get_source_url(obj),
+            sourceLabel=_get_source_label(obj),
+            media=Media.parse(obj),
+            card=_parse_card(obj, url),
+            possibly_sensitive=obj.get("possibly_sensitive", None),
+        )
+
+        # issue #42 – restore full rt text
+        rt = doc.retweetedTweet
+        if rt is not None and rt.user is not None and doc.rawContent.endswith("…"):
+            rt_msg = f"RT @{rt.user.username}: {rt.rawContent}"
+            if doc.rawContent != rt_msg:
+                doc.rawContent = rt_msg
+
+        return doc
+
+
+@dataclass
+class MediaPhoto(JSONTrait):
+    url: str
+
+    @staticmethod
+    def parse(obj: dict):
+        return MediaPhoto(url=obj["media_url_https"])
+
+
+@dataclass
+class MediaVideo(JSONTrait):
+    thumbnailUrl: str
+    variants: list["MediaVideoVariant"]
+    duration: int
+    views: int | None = None
+
+    @staticmethod
+    def parse(obj: dict):
+        return MediaVideo(
+            thumbnailUrl=obj["media_url_https"],
+            variants=[
+                MediaVideoVariant.parse(x) for x in obj["video_info"]["variants"] if "bitrate" in x
+            ],
+            duration=obj["video_info"]["duration_millis"],
+            views=int_or(obj, "mediaStats.viewCount"),
+        )
+
+
+@dataclass
+class MediaAnimated(JSONTrait):
+    thumbnailUrl: str
+    videoUrl: str
+
+    @staticmethod
+    def parse(obj: dict):
+        try:
+            return MediaAnimated(
+                thumbnailUrl=obj["media_url_https"],
+                videoUrl=obj["video_info"]["variants"][0]["url"],
+            )
+        except KeyError:
+            return None
+
+
+@dataclass
+class MediaVideoVariant(JSONTrait):
+    contentType: str
+    bitrate: int
+    url: str
+
+    @staticmethod
+    def parse(obj: dict):
+        return MediaVideoVariant(
+            contentType=obj["content_type"],
+            bitrate=obj["bitrate"],
+            url=obj["url"],
+        )
+
+
+@dataclass
+class Media(JSONTrait):
+    photos: list[MediaPhoto] = field(default_factory=list)
+    videos: list[MediaVideo] = field(default_factory=list)
+    animated: list[MediaAnimated] = field(default_factory=list)
+
+    @staticmethod
+    def parse(obj: dict):
+        photos: list[MediaPhoto] = []
+        videos: list[MediaVideo] = []
+        animated: list[MediaAnimated] = []
+
+        for x in get_or(obj, "extended_entities.media", []):
+            if x["type"] == "video":
+                if video := MediaVideo.parse(x):
+                    videos.append(video)
+                continue
+
+            if x["type"] == "photo":
+                if photo := MediaPhoto.parse(x):
+                    photos.append(photo)
+                continue
+
+            if x["type"] == "animated_gif":
+                if animated_gif := MediaAnimated.parse(x):
+                    animated.append(animated_gif)
+                continue
+
+            logger.warning(f"Unknown media type: {x['type']}: {json.dumps(x)}")
+
+        return Media(photos=photos, videos=videos, animated=animated)
+
+
+@dataclass
+class Card(JSONTrait):
+    pass
+
+
+@dataclass
+class SummaryCard(Card):
+    title: str
+    description: str
+    vanityUrl: str
+    url: str
+    photo: MediaPhoto | None = None
+    video: MediaVideo | None = None
+    _type: str = "summary"
+
+
+@dataclass
+class PollOption(JSONTrait):
+    label: str
+    votesCount: int
+
+
+@dataclass
+class PollCard(Card):
+    options: list[PollOption]
+    finished: bool
+    _type: str = "poll"
+
+
+@dataclass
+class BroadcastCard(Card):
+    title: str
+    url: str
+    photo: MediaPhoto | None = None
+    _type: str = "broadcast"
+
+
+@dataclass
+class AudiospaceCard(Card):
+    url: str
+    _type: str = "audiospace"
+
+
+@dataclass
+class RequestParam(JSONTrait):
+    key: str
+    value: str
+
+
+@dataclass
+class TrendUrl(JSONTrait):
+    url: str
+    urlType: str
+    urlEndpointOptions: list[RequestParam]
+
+    @staticmethod
+    def parse(obj: dict):
+        return TrendUrl(
+            url=obj["url"],
+            urlType=obj["urlType"],
+            urlEndpointOptions=[
+                RequestParam(key=x["key"], value=x["value"])
+                for x in obj["urtEndpointOptions"]["requestParams"]
+            ],
+        )
+
+
+@dataclass
+class TrendMetadata(JSONTrait):
+    domain_context: str
+    meta_description: str
+    url: TrendUrl
+
+    @staticmethod
+    def parse(obj: dict):
+        return TrendMetadata(
+            domain_context=obj["domain_context"],
+            meta_description=obj["meta_description"],
+            url=TrendUrl.parse(obj["url"]),
+        )
+
+
+@dataclass
+class GroupedTrend(JSONTrait):
+    name: str
+    url: TrendUrl
+
+    @staticmethod
+    def parse(obj: dict):
+        return GroupedTrend(name=obj["name"], url=TrendUrl.parse(obj["url"]))
+
+
+@dataclass
+class Trend(JSONTrait):
+    id: Optional[str]
+    rank: Optional[str | int]
+    name: str
+    trend_url: TrendUrl
+    trend_metadata: TrendMetadata
+    grouped_trends: list[GroupedTrend] = field(default_factory=list)
+    _type: str = "timelinetrend"
+
+    @staticmethod
+    def parse(obj: dict, res=None):
+        grouped_trends = [GroupedTrend.parse(x) for x in obj.get("grouped_trends", [])]
+        return Trend(
+            id=f"trend-{obj['name']}",
+            name=obj["name"],
+            rank=int(obj["rank"]) if "rank" in obj else None,
+            trend_url=TrendUrl.parse(obj["trend_url"]),
+            trend_metadata=TrendMetadata.parse(obj["trend_metadata"]),
+            grouped_trends=grouped_trends,
+        )
+
+
+def _parse_card_get_bool(values: list[dict], key: str):
+    for x in values:
+        if x["key"] == key:
+            return x["value"]["boolean_value"]
+    return False
+
+
+def _parse_card_get_str(values: list[dict], key: str, defaultVal=None) -> str | None:
+    for x in values:
+        if x["key"] == key:
+            return x["value"]["string_value"]
+    return defaultVal
+
+
+def _parse_card_extract_str(values: list[dict], key: str):
+    pretenders = [x["value"]["string_value"] for x in values if x["key"] == key]
+    new_values = [x for x in values if x["key"] != key]
+    return pretenders[0] if pretenders else "", new_values
+
+
+def _parse_card_extract_title(values: list[dict]):
+    new_values, pretenders = [], []
+    # title is trimmed to 70 chars, so try to find the longest text in alt_text
+    for x in values:
+        k = x["key"]
+        if k == "title" or k.endswith("_alt_text"):
+            pretenders.append(x["value"]["string_value"])
+        else:
+            new_values.append(x)
+
+    pretenders = sorted(pretenders, key=lambda x: len(x), reverse=True)
+    return pretenders[0] if pretenders else "", new_values
+
+
+def _parse_card_extract_largest_photo(values: list[dict]):
+    photos = [x for x in values if x["value"]["type"] == "IMAGE"]
+    photos = sorted(photos, key=lambda x: x["value"]["image_value"]["height"], reverse=True)
+    values = [x for x in values if x["value"]["type"] != "IMAGE"]
+    if photos:
+        return MediaPhoto(url=photos[0]["value"]["image_value"]["url"]), values
+    else:
+        return None, values
+
+
+def _parse_card_prepare_values(obj: dict):
+    values = get_or(obj, "card.legacy.binding_values", [])
+    # values = sorted(values, key=lambda x: x["key"])
+    # values = [x for x in values if x["key"] not in {"domain", "creator", "site"}]
+    values = [x for x in values if x["value"]["type"] != "IMAGE_COLOR"]
+    return values
+
+
+def _parse_card(obj: dict, url: str):
+    name = get_or(obj, "card.legacy.name", None)
+    if not name:
+        return None
+
+    if name in {"summary", "summary_large_image", "player"}:
+        val = _parse_card_prepare_values(obj)
+        title, val = _parse_card_extract_title(val)
+        description, val = _parse_card_extract_str(val, "description")
+        vanity_url, val = _parse_card_extract_str(val, "vanity_url")
+        url, val = _parse_card_extract_str(val, "card_url")
+        photo, val = _parse_card_extract_largest_photo(val)
+
+        return SummaryCard(
+            title=title,
+            description=description,
+            vanityUrl=vanity_url,
+            url=url,
+            photo=photo,
+        )
+
+    if name == "unified_card":
+        val = _parse_card_prepare_values(obj)
+        val = [x for x in val if x["key"] == "unified_card"][0]["value"]["string_value"]
+        val = json.loads(val)
+
+        co = get_or(val, "component_objects", {})
+        do = get_or(val, "destination_objects", {})
+        me = list(get_or(val, "media_entities", {}).values())
+        if len(me) > 1:
+            logger.debug(f"[Card] Multiple media entities: {json.dumps(me, indent=2)}")
+
+        me = me[0] if me else {}
+
+        title = get_or(co, "details_1.data.title.content", "")
+        description = get_or(co, "details_1.data.subtitle.content", "")
+        vanity_url = get_or(do, "browser_with_docked_media_1.data.url_data.vanity", "")
+        url = get_or(do, "browser_with_docked_media_1.data.url_data.url", "")
+        video = MediaVideo.parse(me) if me and me["type"] == "video" else None
+        photo = MediaPhoto.parse(me) if me and me["type"] == "photo" else None
+
+        return SummaryCard(
+            title=title,
+            description=description,
+            vanityUrl=vanity_url,
+            url=url,
+            photo=photo,
+            video=video,
+        )
+
+    if re.match(r"poll\d+choice_text_only", name):
+        val = _parse_card_prepare_values(obj)
+
+        options = []
+        for x in range(20):
+            label = _parse_card_get_str(val, f"choice{x + 1}_label")
+            votes = _parse_card_get_str(val, f"choice{x + 1}_count")
+            if label is None or votes is None:
+                break
+
+            options.append(PollOption(label=label, votesCount=int(votes)))
+
+        finished = _parse_card_get_bool(val, "counts_are_final")
+        # duration_minutes = int(_parse_card_get_str(val, "duration_minutes") or "0")
+        # end_datetime_utc = _parse_card_get_str(val, "end_datetime_utc")
+        # print(json.dumps(val, indent=2))
+        return PollCard(options=options, finished=finished)
+
+    if name == "745291183405076480:broadcast":
+        val = _parse_card_prepare_values(obj)
+        card_url = _parse_card_get_str(val, "broadcast_url")
+        card_title = _parse_card_get_str(val, "broadcast_title")
+        photo, _ = _parse_card_extract_largest_photo(val)
+        if card_url is None or card_title is None:
+            return None
+
+        return BroadcastCard(title=card_title, url=card_url, photo=photo)
+
+    if name == "3691233323:audiospace":
+        # no more data in this object, possible extra api call needed to get card info
+        val = _parse_card_prepare_values(obj)
+        card_url = _parse_card_get_str(val, "card_url")
+        if card_url is None:
+            return None
+
+        # print(json.dumps(val, indent=2))
+        return AudiospaceCard(url=card_url)
+
+    logger.warning(f"Unknown card type '{name}' on {url}")
+    if "PYTEST_CURRENT_TEST" in os.environ:  # help debugging tests
+        print(f"Unknown card type '{name}' on {url}", file=sys.stderr)
+        # print(json.dumps(obj["card"]["legacy"], indent=2))
+    return None
+
+
+# internal helpers
+
+
+def _get_reply_user(tw_obj: dict, res: dict):
+    user_id = tw_obj.get("in_reply_to_user_id_str", None)
+    if user_id is None:
+        return None
+
+    if user_id in res["users"]:
+        return UserRef.parse(res["users"][user_id])
+
+    mentions = get_or(tw_obj, "entities.user_mentions", [])
+    mention = find_item(mentions, lambda x: x["id_str"] == tw_obj["in_reply_to_user_id_str"])
+    if mention:
+        return UserRef.parse(mention)
+
+    # todo: user not found in reply (probably deleted or hidden)
+    return None
+
+
+def _get_source_url(tw_obj: dict):
+    source = tw_obj.get("source", None)
+    if source and (match := re.search(r'href=[\'"]?([^\'" >]+)', source)):
+        return str(match.group(1))
+    return None
+
+
+def _get_source_label(tw_obj: dict):
+    source = tw_obj.get("source", None)
+    if source and (match := re.search(r">([^<]*)<", source)):
+        return str(match.group(1))
+    return None
+
+
+def _parse_links(obj: dict, paths: list[str]):
+    links = []
+    for x in paths:
+        links.extend(get_or(obj, x, []))
+
+    links = [TextLink.parse(x) for x in links]
+    links = [x for x in links if x is not None]
+
+    return links
+
+
+def _first(obj: dict, paths: list[str]):
+    for x in paths:
+        cid = get_or(obj, x, None)
+        if cid is not None:
+            return cid
+    return None
+
+
+def _get_views(obj: dict, rt_obj: dict):
+    for x in [obj, rt_obj]:
+        for y in ["ext_views.count", "views.count"]:
+            k = int_or(x, y)
+            if k is not None:
+                return k
+    return None
+
+
+def _write_dump(kind: str, e: Exception, x: dict, obj: dict):
+    uniq = "".join(random.choice(string.ascii_lowercase) for _ in range(5))
+    time = utc.now().strftime("%Y-%m-%d_%H-%M-%S")
+    dumpfile = f"/tmp/twscrape/twscrape_parse_error_{time}_{uniq}.txt"
+    os.makedirs(os.path.dirname(dumpfile), exist_ok=True)
+
+    with open(dumpfile, "w") as fp:
+        msg = [
+            f"Error parsing {kind}. Error: {type(e)}",
+            traceback.format_exc(),
+            json.dumps(x, default=str),
+            json.dumps(obj, default=str),
+        ]
+        fp.write("\n\n".join(msg))
+
+    logger.error(f"Failed to parse response of {kind}, writing dump to {dumpfile}")
+
+
+def _parse_items(rep: httpx.Response, kind: str, limit: int = -1):
+    if kind == "user":
+        Cls, key = User, "users"
+    elif kind == "tweet":
+        Cls, key = Tweet, "tweets"
+    elif kind == "trends":
+        Cls, key = Trend, "trends"
+    else:
+        raise ValueError(f"Invalid kind: {kind}")
+
+    # check for dict, because httpx.Response can be mocked in tests with different type
+    res = rep if isinstance(rep, dict) else rep.json()
+    obj = to_old_rep(res)
+
+    ids = set()
+    for x in obj[key].values():
+        if limit != -1 and len(ids) >= limit:
+            # todo: move somewhere in configuration like force_limit
+            # https://github.com/vladkens/twscrape/issues/26#issuecomment-1656875132
+            # break
+            pass
+
+        try:
+            tmp = Cls.parse(x, obj)
+            if tmp.id not in ids:
+                ids.add(tmp.id)
+                yield tmp
+        except Exception as e:
+            _write_dump(kind, e, x, obj)
+            continue
+
+
+# public helpers
+
+
+def parse_tweet(rep: httpx.Response, twid: int) -> Tweet | None:
+    try:
+        docs = list(parse_tweets(rep))
+        for x in docs:
+            if x.id == twid:
+                return x
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse tweet {twid} - {type(e)}:\n{traceback.format_exc()}")
+        return None
+
+
+def parse_user(rep: httpx.Response) -> User | None:
+    try:
+        docs = list(parse_users(rep))
+        if len(docs) == 1:
+            return docs[0]
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse user - {type(e)}:\n{traceback.format_exc()}")
+        return None
+
+
+def parse_trend(rep: httpx.Response) -> Trend | None:
+    try:
+        docs = list(parse_trends(rep))
+        if len(docs) == 1:
+            return docs[0]
+        return None
+    except Exception as e:
+        logger.error(f"Failed to parse trend - {type(e)}:\n{traceback.format_exc()}")
+        return None
+
+
+def parse_tweets(rep: httpx.Response, limit: int = -1) -> Generator[Tweet, None, None]:
+    return _parse_items(rep, "tweet", limit)  # type: ignore
+
+
+def parse_users(rep: httpx.Response, limit: int = -1) -> Generator[User, None, None]:
+    return _parse_items(rep, "user", limit)  # type: ignore
+
+
+def parse_trends(rep: httpx.Response, limit: int = -1) -> Generator[Trend, None, None]:
+    return _parse_items(rep, kind="trends", limit=limit)  # type: ignore
+</file>
+
+<file path="twscrape/queue_client.py">
+import asyncio
+import json
+import os
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
+from httpx import AsyncClient, Response
+
+from .accounts_pool import Account, AccountsPool
+from .logger import logger
+from .utils import utc
+from .xclid import XClIdGen
+
+ReqParams = dict[str, str | int] | None
+TMP_TS = utc.now().isoformat().split(".")[0].replace("T", "_").replace(":", "-")[0:16]
+
+
+class HandledError(Exception): ...
+
+
+class AbortReqError(Exception): ...
+
+
+class XClIdGenStore:
+    items: dict[str, XClIdGen] = {}  # username -> XClIdGen
+
+    @classmethod
+    async def get(cls, username: str, fresh=False) -> XClIdGen:
+        if username in cls.items and not fresh:
+            return cls.items[username]
+
+        tries = 0
+        while tries < 3:
+            try:
+                clid_gen = await XClIdGen.create()
+                cls.items[username] = clid_gen
+                return clid_gen
+            except httpx.HTTPStatusError:
+                tries += 1
+                await asyncio.sleep(1)
+
+        raise AbortReqError(
+            "Faield to create XClIdGen. See: https://github.com/vladkens/twscrape/issues/248"
+        )
+
+
+class Ctx:
+    def __init__(self, acc: Account, clt: AsyncClient):
+        self.req_count = 0
+        self.acc = acc
+        self.clt = clt
+
+    async def aclose(self):
+        await self.clt.aclose()
+
+    async def req(self, method: str, url: str, params: ReqParams = None) -> Response:
+        # if code 404 on first try then generate new x-client-transaction-id and retry
+        # https://github.com/vladkens/twscrape/issues/248
+        path = urlparse(url).path or "/"
+
+        tries = 0
+        while tries < 3:
+            gen = await XClIdGenStore.get(self.acc.username, fresh=tries > 0)
+            hdr = {"x-client-transaction-id": gen.calc(method, path)}
+            rep = await self.clt.request(method, url, params=params, headers=hdr)
+            if rep.status_code != 404:
+                return rep
+
+            tries += 1
+            logger.debug(f"Retrying request with new x-client-transaction-id: {url}")
+            await asyncio.sleep(1)
+
+        raise AbortReqError(
+            "Faield to get XClIdGen. See: https://github.com/vladkens/twscrape/issues/248"
+        )
+
+
+def req_id(rep: Response):
+    lr = str(rep.headers.get("x-rate-limit-remaining", -1))
+    ll = str(rep.headers.get("x-rate-limit-limit", -1))
+    sz = max(len(lr), len(ll))
+    lr, ll = lr.rjust(sz), ll.rjust(sz)
+
+    username = getattr(rep, "__username", "<UNKNOWN>")
+    return f"{lr}/{ll} - {username}"
+
+
+def dump_rep(rep: Response):
+    count = getattr(dump_rep, "__count", -1) + 1
+    setattr(dump_rep, "__count", count)
+
+    acc = getattr(rep, "__username", "<unknown>")
+    outfile = f"{count:05d}_{rep.status_code}_{acc}.txt"
+    outfile = f"/tmp/twscrape-{TMP_TS}/{outfile}"
+    os.makedirs(os.path.dirname(outfile), exist_ok=True)
+
+    msg = []
+    msg.append(f"{count:,d} - {req_id(rep)}")
+    msg.append(f"{rep.status_code} {rep.request.method} {rep.request.url}")
+    msg.append("\n")
+    # msg.append("\n".join([str(x) for x in list(rep.request.headers.items())]))
+    msg.append("\n".join([str(x) for x in list(rep.headers.items())]))
+    msg.append("\n")
+
+    try:
+        msg.append(json.dumps(rep.json(), indent=2))
+    except json.JSONDecodeError:
+        msg.append(rep.text)
+
+    txt = "\n".join(msg)
+    with open(outfile, "w") as f:
+        f.write(txt)
+
+
+class QueueClient:
+    def __init__(self, pool: AccountsPool, queue: str, debug=False, proxy: str | None = None):
+        self.pool = pool
+        self.queue = queue
+        self.debug = debug
+        self.ctx: Ctx | None = None
+        self.proxy = proxy
+
+    async def __aenter__(self):
+        await self._get_ctx()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self._close_ctx()
+
+    async def _close_ctx(self, reset_at=-1, inactive=False, msg: str | None = None):
+        if self.ctx is None:
+            return
+
+        ctx, self.ctx, self.req_count = self.ctx, None, 0
+        username = ctx.acc.username
+        await ctx.aclose()
+
+        if inactive:
+            await self.pool.mark_inactive(username, msg)
+            return
+
+        if reset_at > 0:
+            await self.pool.lock_until(ctx.acc.username, self.queue, reset_at, ctx.req_count)
+            return
+
+        await self.pool.unlock(ctx.acc.username, self.queue, ctx.req_count)
+
+    async def _get_ctx(self):
+        if self.ctx:
+            return self.ctx
+
+        acc = await self.pool.get_for_queue_or_wait(self.queue)
+        if acc is None:
+            return None
+
+        clt = acc.make_client(proxy=self.proxy)
+        self.ctx = Ctx(acc, clt)
+        return self.ctx
+
+    async def _check_rep(self, rep: Response) -> None:
+        """
+        This function can raise Exception and request will be retried or aborted
+        Or if None is returned, response will passed to api parser as is
+        """
+
+        if self.debug:
+            dump_rep(rep)
+
+        try:
+            res = rep.json()
+        except json.JSONDecodeError:
+            res: Any = {"_raw": rep.text}
+
+        limit_remaining = int(rep.headers.get("x-rate-limit-remaining", -1))
+        limit_reset = int(rep.headers.get("x-rate-limit-reset", -1))
+        # limit_max = int(rep.headers.get("x-rate-limit-limit", -1))
+
+        err_msg = "OK"
+        if "errors" in res:
+            err_msg = set([f"({x.get('code', -1)}) {x['message']}" for x in res["errors"]])
+            err_msg = "; ".join(list(err_msg))
+
+        log_msg = f"{rep.status_code:3d} - {req_id(rep)} - {err_msg}"
+        logger.trace(log_msg)
+
+        # for dev: need to add some features in api.py
+        if err_msg.startswith("(336) The following features cannot be null"):
+            logger.error(f"[DEV] Update required: {err_msg}")
+            exit(1)
+
+        # general api rate limit
+        if limit_remaining == 0 and limit_reset > 0:
+            logger.debug(f"Rate limited: {log_msg}")
+            await self._close_ctx(limit_reset)
+            raise HandledError()
+
+        # no way to check is account banned in direct way, but this check should work
+        if err_msg.startswith("(88) Rate limit exceeded") and limit_remaining > 0:
+            logger.warning(f"Ban detected: {log_msg}")
+            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            raise HandledError()
+
+        if err_msg.startswith("(326) Authorization: Denied by access control"):
+            logger.warning(f"Ban detected: {log_msg}")
+            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            raise HandledError()
+
+        if err_msg.startswith("(32) Could not authenticate you"):
+            logger.warning(f"Session expired or banned: {log_msg}")
+            await self._close_ctx(-1, inactive=True, msg=err_msg)
+            raise HandledError()
+
+        if err_msg == "OK" and rep.status_code == 403:
+            logger.warning(f"Session expired or banned: {log_msg}")
+            await self._close_ctx(-1, inactive=True, msg=None)
+            raise HandledError()
+
+        # something from twitter side - abort all queries, see: https://github.com/vladkens/twscrape/pull/80
+        if err_msg.startswith("(131) Dependency: Internal error"):
+            # looks like when data exists, we can ignore this error
+            # https://github.com/vladkens/twscrape/issues/166
+            if rep.status_code == 200 and "data" in res and "user" in res["data"]:
+                err_msg = "OK"
+            else:
+                logger.warning(f"Dependency error (request skipped): {err_msg}")
+                raise AbortReqError()
+
+        # content not found
+        if rep.status_code == 200 and "_Missing: No status found with that ID" in err_msg:
+            return  # ignore this error
+
+        # something from twitter side - just ignore it, see: https://github.com/vladkens/twscrape/pull/95
+        if rep.status_code == 200 and "Authorization" in err_msg:
+            logger.warning(f"Authorization unknown error: {log_msg}")
+            return
+
+        if err_msg != "OK":
+            logger.warning(f"API unknown error: {log_msg}")
+            return  # ignore any other unknown errors
+
+        try:
+            rep.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.error(f"Unhandled API response code: {log_msg}")
+            await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
+            raise HandledError()
+
+    async def get(self, url: str, params: ReqParams = None) -> Response | None:
+        return await self.req("GET", url, params=params)
+
+    async def req(self, method: str, url: str, params: ReqParams = None) -> Response | None:
+        unknown_retry, connection_retry = 0, 0
+
+        while True:
+            ctx = await self._get_ctx()  # not need to close client, class implements __aexit__
+            if ctx is None:
+                return None
+
+            try:
+                rep = await ctx.req(method, url, params=params)
+                setattr(rep, "__username", ctx.acc.username)
+                await self._check_rep(rep)
+
+                ctx.req_count += 1  # count only successful
+                unknown_retry, connection_retry = 0, 0
+                return rep
+            except AbortReqError:
+                # abort all queries
+                return
+            except HandledError:
+                # retry with new account
+                continue
+            except (httpx.ReadTimeout, httpx.ProxyError):
+                # http transport failed, just retry with same account
+                continue
+            except (httpx.ConnectError, httpx.ConnectTimeout) as e:
+                # if proxy missconfigured or ???
+                connection_retry += 1
+                if connection_retry >= 3:
+                    raise e
+            except Exception as e:
+                unknown_retry += 1
+                if unknown_retry >= 3:
+                    msg = [
+                        "Unknown error. Account timeouted for 15 minutes.",
+                        "Create issue please: https://github.com/vladkens/twscrape/issues",
+                        f"If it mistake, you can unlock accounts with `twscrape reset_locks`. Err: {type(e)}: {e}",
+                    ]
+
+                    logger.warning(" ".join(msg))
+                    await self._close_ctx(utc.ts() + 60 * 15)  # 15 minutes
+</file>
+
+<file path="Makefile">
+check:
+	@make lint
+	@make test
+
+install:
+	pip install -e .[dev]
+	python -m build
+
+build:
+	python -m build --sdist --wheel --outdir dist/ .
+
+lint:
+	@python -m ruff check --select I --fix .
+	@python -m ruff format .
+	@python -m ruff check .
+	@python -m pyright .
+
+test:
+	@python -m pytest -s --cov=twscrape tests/
+
+test-cov:
+	@python -m pytest -s --cov=twscrape tests/
+	@coverage html
+	@open htmlcov/index.html
+
+test-py:
+	$(eval name=twscrape_py$(v))
+	@docker -l warning build -f Dockerfile.py-matrix --build-arg VER=$(v) -t $(name) .
+	@docker run $(name)
+
+test-sq:
+	$(eval name=twscrape_sq$(v))
+	@docker -l warning build -f Dockerfile.sq-matrix --build-arg SQLY=$(y) --build-arg SQLV=$(v) -t $(name) .
+	@docker run $(name)
+
+test-matrix-py:
+	@make test-py v=3.10
+	@make test-py v=3.11
+	@make test-py v=3.12
+	@make test-py v=3.13
+
+test-matrix-sq:
+	@# https://www.sqlite.org/chronology.html
+	@make test-sq y=2018 v=3240000
+	@make test-sq y=2019 v=3270200
+	@make test-sq y=2019 v=3300100
+	@make test-sq y=2020 v=3330000
+	@make test-sq y=2021 v=3340100
+	@make test-sq y=2023 v=3430000
+	@make test-sq y=2023 v=3440000
+	@make test-sq y=2024 v=3450300
+
+update-mocks:
+	@rm -rf ./tests/mocked-data/raw_*.json
+	twscrape --debug user_by_id --raw 2244994945 | jq > ./tests/mocked-data/raw_user_by_id.json
+	twscrape --debug user_by_login --raw xdevelopers | jq > ./tests/mocked-data/raw_user_by_login.json
+	twscrape --debug following --raw --limit 10  2244994945 | jq > ./tests/mocked-data/raw_following.json
+	twscrape --debug followers --raw --limit 10 2244994945 | jq > ./tests/mocked-data/raw_followers.json
+	twscrape --debug verified_followers --raw --limit 10 2244994945 | jq > ./tests/mocked-data/raw_verified_followers.json
+	twscrape --debug subscriptions --raw --limit 10 58579942 | jq > ./tests/mocked-data/raw_subscriptions.json
+	twscrape --debug tweet_details --raw 1649191520250245121 | jq > ./tests/mocked-data/raw_tweet_details.json
+	twscrape --debug tweet_replies --limit 1 --raw 1649191520250245121 | jq > ./tests/mocked-data/raw_tweet_replies.json
+	twscrape --debug retweeters --raw --limit 10 1649191520250245121 | jq > ./tests/mocked-data/raw_retweeters.json
+	twscrape --debug user_tweets --raw --limit 10 2244994945 | jq > ./tests/mocked-data/raw_user_tweets.json
+	twscrape --debug user_tweets_and_replies --raw --limit 10 2244994945 | jq > ./tests/mocked-data/raw_user_tweets_and_replies.json
+	twscrape --debug user_media --raw --limit 10 2244994945 | jq > ./tests/mocked-data/raw_user_media.json
+	twscrape --debug search --raw --limit 5 "tesla lang:en" | jq > ./tests/mocked-data/raw_search.json
+	twscrape --debug list_timeline --raw --limit 10 1494877848087187461 | jq > ./tests/mocked-data/raw_list_timeline.json
+	twscrape --debug trends --raw sport | jq > ./tests/mocked-data/raw_trends.json
+</file>
+
+<file path="pyproject.toml">
+[build-system]
+requires = ["hatchling>=1.9.1"]
+build-backend = "hatchling.build"
+
+[project]
+name = "twscrape"
+version = "0.17.0"
+authors = [{ name = "vladkens", email = "v.pronsky@gmail.com" }]
+description = "Twitter GraphQL and Search API implementation with SNScrape data models"
+readme = "readme.md"
+requires-python = ">=3.10"
+keywords = ["twitter", "scrape", "scrapper", "api", "snscrape"]
+license = { text = "MIT" }
+classifiers = [
+  'Development Status :: 4 - Beta',
+  'License :: OSI Approved :: MIT License',
+  'Programming Language :: Python :: 3.10',
+  'Programming Language :: Python :: 3.11',
+  'Programming Language :: Python :: 3.12',
+  'Programming Language :: Python :: 3.13',
+]
+dependencies = [
+  "aiosqlite>=0.17.0",
+  "fake-useragent>=1.4.0",
+  "httpx>=0.26.0",
+  "loguru>=0.7.0",
+  "pyotp>=2.9.0",
+  "beautifulsoup4>=4.13.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "pyright>=1.1.369",
+  "pytest-asyncio>=0.23.3",
+  "pytest-cov>=4.1.0",
+  "pytest-httpx>=0.28.0",
+  "pytest>=7.4.4",
+  "ruff>=0.1.11",
+]
+
+[project.urls]
+repository = "https://github.com/vladkens/twscrape"
+
+[project.scripts]
+twscrape = "twscrape.cli:run"
+
+[tool.setuptools]
+packages = ['twscrape']
+
+[tool.hatch.build.targets.wheel]
+packages = ["twscrape"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 99
+
+[tool.ruff.lint]
+ignore = ["E501"]
+</file>
+
+<file path="twscrape/api.py">
+from contextlib import aclosing
+from typing import Literal
+
+from httpx import Response
+
+from .accounts_pool import AccountsPool
+from .logger import set_log_level
+from .models import Tweet, User, parse_trends, parse_tweet, parse_tweets, parse_user, parse_users
+from .queue_client import QueueClient
+from .utils import encode_params, find_obj, get_by_path
+
+# OP_{NAME} – {NAME} should be same as second part of GQL ID (required to auto-update script)
+OP_SearchTimeline = "AIdc203rPpK_k_2KWSdm7g/SearchTimeline"
+OP_UserByRestId = "WJ7rCtezBVT6nk6VM5R8Bw/UserByRestId"
+OP_UserByScreenName = "1VOOyvKkiI3FMmkeDNxM9A/UserByScreenName"
+OP_TweetDetail = "_8aYOgEDz35BrBcBal1-_w/TweetDetail"
+OP_Followers = "Elc_-qTARceHpztqhI9PQA/Followers"
+OP_Following = "C1qZ6bs-L3oc_TKSZyxkXQ/Following"
+OP_Retweeters = "i-CI8t2pJD15euZJErEDrg/Retweeters"
+OP_UserTweets = "HeWHY26ItCfUmm1e6ITjeA/UserTweets"
+OP_UserTweetsAndReplies = "OAx9yEcW3JA9bPo63pcYlA/UserTweetsAndReplies"
+OP_ListLatestTweetsTimeline = "BkauSnPUDQTeeJsxq17opA/ListLatestTweetsTimeline"
+OP_BlueVerifiedFollowers = "ZpmVpf_fBIUgdPErpq2wWg/BlueVerifiedFollowers"
+OP_UserCreatorSubscriptions = "7qcGrVKpcooih_VvJLA1ng/UserCreatorSubscriptions"
+OP_UserMedia = "vFPc2LVIu7so2uA_gHQAdg/UserMedia"
+OP_Bookmarks = "-LGfdImKeQz0xS_jjUwzlA/Bookmarks"
+OP_GenericTimelineById = "CT0YFEFf5GOYa5DJcxM91w/GenericTimelineById"
+
+GQL_URL = "https://x.com/i/api/graphql"
+GQL_FEATURES = {  # search values here (view source) https://x.com/
+    "articles_preview_enabled": False,
+    "c9s_tweet_anatomy_moderator_badge_enabled": True,
+    "communities_web_enable_tweet_community_results_fetch": True,
+    "creator_subscriptions_quote_tweet_preview_enabled": False,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "freedom_of_speech_not_reach_fetch_enabled": True,
+    "graphql_is_translatable_rweb_tweet_is_translatable_enabled": True,
+    "longform_notetweets_consumption_enabled": True,
+    "longform_notetweets_inline_media_enabled": True,
+    "longform_notetweets_rich_text_read_enabled": True,
+    "responsive_web_edit_tweet_api_enabled": True,
+    "responsive_web_enhance_cards_enabled": False,
+    "responsive_web_graphql_exclude_directive_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+    "responsive_web_media_download_video_enabled": False,
+    "responsive_web_twitter_article_tweet_consumption_enabled": True,
+    "rweb_tipjar_consumption_enabled": True,
+    "rweb_video_timestamps_enabled": True,
+    "standardized_nudges_misinfo": True,
+    "tweet_awards_web_tipping_enabled": False,
+    "tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled": True,
+    "tweet_with_visibility_results_prefer_gql_media_interstitial_enabled": False,
+    "tweetypie_unmention_optimization_enabled": True,
+    "verified_phone_label_enabled": False,
+    "view_counts_everywhere_api_enabled": True,
+    "responsive_web_grok_analyze_button_fetch_trends_enabled": False,
+    "premium_content_api_read_enabled": False,
+    "profile_label_improvements_pcf_label_in_post_enabled": False,
+    "responsive_web_grok_share_attachment_enabled": False,
+    "responsive_web_grok_analyze_post_followups_enabled": False,
+    "responsive_web_grok_image_annotation_enabled": False,
+    "responsive_web_grok_analysis_button_from_backend": False,
+    "responsive_web_jetfuel_frame": False,
+    "rweb_video_screen_enabled": True,
+    "responsive_web_grok_show_grok_translated_post": True,
+}
+
+KV = dict | None
+TrendId = Literal["trending", "news", "sport", "entertainment"] | str
+
+
+class API:
+    # Note: kv is variables, ft is features from original GQL request
+    pool: AccountsPool
+
+    def __init__(
+        self,
+        pool: AccountsPool | str | None = None,
+        debug=False,
+        proxy: str | None = None,
+        raise_when_no_account=False,
+    ):
+        if isinstance(pool, AccountsPool):
+            self.pool = pool
+        elif isinstance(pool, str):
+            self.pool = AccountsPool(db_file=pool, raise_when_no_account=raise_when_no_account)
+        else:
+            self.pool = AccountsPool(raise_when_no_account=raise_when_no_account)
+
+        self.proxy = proxy
+        self.debug = debug
+        if self.debug:
+            set_log_level("DEBUG")
+
+    # general helpers
+
+    def _is_end(self, rep: Response, q: str, res: list, cur: str | None, cnt: int, lim: int):
+        new_count = len(res)
+        new_total = cnt + new_count
+
+        is_res = new_count > 0
+        is_cur = cur is not None
+        is_lim = lim > 0 and new_total >= lim
+
+        return rep if is_res else None, new_total, is_cur and not is_lim
+
+    def _get_cursor(self, obj: dict, cursor_type="Bottom") -> str | None:
+        if cur := find_obj(obj, lambda x: x.get("cursorType") == cursor_type):
+            return cur.get("value")
+        return None
+
+    # gql helpers
+
+    async def _gql_items(
+        self, op: str, kv: dict, ft: dict | None = None, limit=-1, cursor_type="Bottom"
+    ):
+        queue, cur, cnt, active = op.split("/")[-1], None, 0, True
+        kv, ft = {**kv}, {**GQL_FEATURES, **(ft or {})}
+
+        async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
+            while active:
+                params = {"variables": kv, "features": ft}
+                if cur is not None:
+                    params["variables"]["cursor"] = cur
+                if queue in ("SearchTimeline", "ListLatestTweetsTimeline"):
+                    params["fieldToggles"] = {"withArticleRichContentState": False}
+                if queue in ("UserMedia",):
+                    params["fieldToggles"] = {"withArticlePlainText": False}
+
+                rep = await client.get(f"{GQL_URL}/{op}", params=encode_params(params))
+                if rep is None:
+                    return
+
+                obj = rep.json()
+                els = get_by_path(obj, "entries") or []
+                els = [
+                    x
+                    for x in els
+                    if not (
+                        x["entryId"].startswith("cursor-")
+                        or x["entryId"].startswith("messageprompt-")
+                    )
+                ]
+                cur = self._get_cursor(obj, cursor_type)
+
+                rep, cnt, active = self._is_end(rep, queue, els, cur, cnt, limit)
+                if rep is None:
+                    return
+
+                yield rep
+
+    async def _gql_item(self, op: str, kv: dict, ft: dict | None = None):
+        ft = ft or {}
+        queue = op.split("/")[-1]
+        async with QueueClient(self.pool, queue, self.debug, proxy=self.proxy) as client:
+            params = {"variables": {**kv}, "features": {**GQL_FEATURES, **ft}}
+            return await client.get(f"{GQL_URL}/{op}", params=encode_params(params))
+
+    # search
+
+    async def search_raw(self, q: str, limit=-1, kv: KV = None):
+        op = OP_SearchTimeline
+        kv = {
+            "rawQuery": q,
+            "count": 20,
+            "product": "Latest",
+            "querySource": "typed_query",
+            **(kv or {}),
+        }
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def search(self, q: str, limit=-1, kv: KV = None):
+        async with aclosing(self.search_raw(q, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    yield x
+
+    async def search_user(self, q: str, limit=-1, kv: KV = None):
+        kv = {"product": "People", **(kv or {})}
+        async with aclosing(self.search_raw(q, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # user_by_id
+
+    async def user_by_id_raw(self, uid: int, kv: KV = None):
+        op = OP_UserByRestId
+        kv = {"userId": str(uid), "withSafetyModeUserFields": True, **(kv or {})}
+        ft = {
+            "hidden_profile_likes_enabled": True,
+            "highlights_tweets_tab_ui_enabled": True,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "hidden_profile_subscriptions_enabled": True,
+            "responsive_web_twitter_article_notes_tab_enabled": False,
+            "subscriptions_feature_can_gift_premium": False,
+            "profile_label_improvements_pcf_label_in_post_enabled": False,
+        }
+        return await self._gql_item(op, kv, ft)
+
+    async def user_by_id(self, uid: int, kv: KV = None) -> User | None:
+        rep = await self.user_by_id_raw(uid, kv=kv)
+        return parse_user(rep) if rep else None
+
+    # user_by_login
+
+    async def user_by_login_raw(self, login: str, kv: KV = None):
+        op = OP_UserByScreenName
+        kv = {"screen_name": login, "withSafetyModeUserFields": True, **(kv or {})}
+        ft = {
+            "highlights_tweets_tab_ui_enabled": True,
+            "hidden_profile_likes_enabled": True,
+            "creator_subscriptions_tweet_preview_api_enabled": True,
+            "hidden_profile_subscriptions_enabled": True,
+            "subscriptions_verification_info_verified_since_enabled": True,
+            "subscriptions_verification_info_is_identity_verified_enabled": False,
+            "responsive_web_twitter_article_notes_tab_enabled": False,
+            "subscriptions_feature_can_gift_premium": False,
+            "profile_label_improvements_pcf_label_in_post_enabled": False,
+        }
+        return await self._gql_item(op, kv, ft)
+
+    async def user_by_login(self, login: str, kv: KV = None) -> User | None:
+        rep = await self.user_by_login_raw(login, kv=kv)
+        return parse_user(rep) if rep else None
+
+    # tweet_details
+
+    async def tweet_details_raw(self, twid: int, kv: KV = None):
+        op = OP_TweetDetail
+        kv = {
+            "focalTweetId": str(twid),
+            "with_rux_injections": True,
+            "includePromotedContent": True,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withBirdwatchNotes": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+        return await self._gql_item(op, kv)
+
+    async def tweet_details(self, twid: int, kv: KV = None) -> Tweet | None:
+        rep = await self.tweet_details_raw(twid, kv=kv)
+        return parse_tweet(rep, twid) if rep else None
+
+    # tweet_replies
+    # note: uses same op as tweet_details, see: https://github.com/vladkens/twscrape/issues/104
+
+    async def tweet_replies_raw(self, twid: int, limit=-1, kv: KV = None):
+        op = OP_TweetDetail
+        kv = {
+            "focalTweetId": str(twid),
+            "referrer": "tweet",
+            "with_rux_injections": True,
+            "includePromotedContent": True,
+            "withCommunity": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withBirdwatchNotes": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+        async with aclosing(
+            self._gql_items(op, kv, limit=limit, cursor_type="ShowMoreThreads")
+        ) as gen:
+            async for x in gen:
+                yield x
+
+    async def tweet_replies(self, twid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.tweet_replies_raw(twid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    if x.inReplyToTweetId == twid:
+                        yield x
+
+    # followers
+
+    async def followers_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_Followers
+        kv = {"userId": str(uid), "count": 20, "includePromotedContent": False, **(kv or {})}
+        ft = {"responsive_web_twitter_article_notes_tab_enabled": False}
+        async with aclosing(self._gql_items(op, kv, limit=limit, ft=ft)) as gen:
+            async for x in gen:
+                yield x
+
+    async def followers(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.followers_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # verified_followers
+
+    async def verified_followers_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_BlueVerifiedFollowers
+        kv = {"userId": str(uid), "count": 20, "includePromotedContent": False, **(kv or {})}
+        ft = {
+            "responsive_web_twitter_article_notes_tab_enabled": True,
+        }
+        async with aclosing(self._gql_items(op, kv, limit=limit, ft=ft)) as gen:
+            async for x in gen:
+                yield x
+
+    async def verified_followers(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.verified_followers_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # following
+
+    async def following_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_Following
+        kv = {"userId": str(uid), "count": 20, "includePromotedContent": False, **(kv or {})}
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def following(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.following_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # subscriptions
+
+    async def subscriptions_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_UserCreatorSubscriptions
+        kv = {"userId": str(uid), "count": 20, "includePromotedContent": False, **(kv or {})}
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def subscriptions(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.subscriptions_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # retweeters
+
+    async def retweeters_raw(self, twid: int, limit=-1, kv: KV = None):
+        op = OP_Retweeters
+        kv = {"tweetId": str(twid), "count": 20, "includePromotedContent": True, **(kv or {})}
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def retweeters(self, twid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.retweeters_raw(twid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_users(rep.json(), limit):
+                    yield x
+
+    # user_tweets
+
+    async def user_tweets_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_UserTweets
+        kv = {
+            "userId": str(uid),
+            "count": 40,
+            "includePromotedContent": True,
+            "withQuickPromoteEligibilityTweetFields": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def user_tweets(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.user_tweets_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    yield x
+
+    # user_tweets_and_replies
+
+    async def user_tweets_and_replies_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_UserTweetsAndReplies
+        kv = {
+            "userId": str(uid),
+            "count": 40,
+            "includePromotedContent": True,
+            "withCommunity": True,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def user_tweets_and_replies(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.user_tweets_and_replies_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    yield x
+
+    # user_media
+
+    async def user_media_raw(self, uid: int, limit=-1, kv: KV = None):
+        op = OP_UserMedia
+        kv = {
+            "userId": str(uid),
+            "count": 40,
+            "includePromotedContent": False,
+            "withClientEventToken": False,
+            "withBirdwatchNotes": False,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def user_media(self, uid: int, limit=-1, kv: KV = None):
+        async with aclosing(self.user_media_raw(uid, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep, limit):
+                    # sometimes some tweets without media, so skip them
+                    media_count = (
+                        len(x.media.photos) + len(x.media.videos) + len(x.media.animated)
+                        if x.media
+                        else 0
+                    )
+
+                    if media_count > 0:
+                        yield x
+
+    # list_timeline
+
+    async def list_timeline_raw(self, list_id: int, limit=-1, kv: KV = None):
+        op = OP_ListLatestTweetsTimeline
+        kv = {"listId": str(list_id), "count": 20, **(kv or {})}
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def list_timeline(self, list_id: int, limit=-1, kv: KV = None):
+        async with aclosing(self.list_timeline_raw(list_id, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep, limit):
+                    yield x
+
+    # trends
+
+    async def trends_raw(self, trend_id: TrendId, limit=-1, kv: KV = None):
+        map = {
+            "trending": "VGltZWxpbmU6DAC2CwABAAAACHRyZW5kaW5nAAA",
+            "news": "VGltZWxpbmU6DAC2CwABAAAABG5ld3MAAA",
+            "sport": "VGltZWxpbmU6DAC2CwABAAAABnNwb3J0cwAA",
+            "entertainment": "VGltZWxpbmU6DAC2CwABAAAADWVudGVydGFpbm1lbnQAAA",
+        }
+        trend_id = map.get(trend_id, trend_id)
+
+        op = OP_GenericTimelineById
+        kv = {
+            "timelineId": trend_id,
+            "count": 20,
+            "withQuickPromoteEligibilityTweetFields": True,
+            **(kv or {}),
+        }
+        async with aclosing(self._gql_items(op, kv, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def trends(self, trend_id: TrendId, limit=-1, kv: KV = None):
+        async with aclosing(self.trends_raw(trend_id, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_trends(rep, limit):
+                    yield x
+
+    async def search_trend(self, q: str, limit=-1, kv: KV = None):
+        kv = {
+            "querySource": "trend_click",
+            **(kv or {}),
+        }
+        async with aclosing(self.search_raw(q, limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    yield x
+
+    # Get current user bookmarks
+
+    async def bookmarks_raw(self, limit=-1, kv: KV = None):
+        op = OP_Bookmarks
+        kv = {
+            "count": 20,
+            "includePromotedContent": False,
+            "withClientEventToken": False,
+            "withBirdwatchNotes": False,
+            "withVoice": True,
+            "withV2Timeline": True,
+            **(kv or {}),
+        }
+        ft = {
+            "graphql_timeline_v2_bookmark_timeline": True,
+        }
+        async with aclosing(self._gql_items(op, kv, ft, limit=limit)) as gen:
+            async for x in gen:
+                yield x
+
+    async def bookmarks(self, limit=-1, kv: KV = None):
+        async with aclosing(self.bookmarks_raw(limit=limit, kv=kv)) as gen:
+            async for rep in gen:
+                for x in parse_tweets(rep.json(), limit):
+                    yield x
+</file>
+
+</files>
