@@ -6,6 +6,7 @@ from typing import TypedDict
 
 from fake_useragent import UserAgent
 from httpx import HTTPStatusError
+from twscrape import metrics
 
 from .account import Account
 from .db import execute, fetchall, fetchone
@@ -156,13 +157,16 @@ class AccountsPool:
         try:
             await login(account, cfg=self._login_config)
             logger.info(f"Logged in to {account.username} successfully")
+            metrics.login_attempts_total.labels(username=account.username, status='success').inc()
             return True
         except HTTPStatusError as e:
             rep = e.response
             logger.error(f"Failed to login '{account.username}': {rep.status_code} - {rep.text}")
+            metrics.login_attempts_total.labels(username=account.username, status='http_error').inc()
             return False
         except Exception as e:
             logger.error(f"Failed to login '{account.username}': {e}")
+            metrics.login_attempts_total.labels(username=account.username, status='unknown_error').inc()
             return False
         finally:
             await self.save(account)
@@ -289,10 +293,12 @@ class AccountsPool:
             account = await self.get_for_queue(queue)
             if not account:
                 if self._raise_when_no_account or get_env_bool("TWS_RAISE_WHEN_NO_ACCOUNT"):
+                    metrics.account_pool_requests_total.labels(queue=queue, status='no_account_raised').inc()
                     raise NoAccountError(f"No account available for queue {queue}")
 
                 if not msg_shown:
                     nat = await self.next_available_at(queue)
+                    metrics.account_pool_requests_total.labels(queue=queue, status='no_account_available').inc()
                     if not nat:
                         logger.warning("No active accounts. Stopping...")
                         return None
@@ -301,12 +307,15 @@ class AccountsPool:
                     logger.info(msg)
                     msg_shown = True
 
+                metrics.account_pool_requests_total.labels(queue=queue, status='waiting').inc()
                 await asyncio.sleep(5)
                 continue
             else:
                 if msg_shown:
                     logger.info(f"Continuing with account {account.username} on queue {queue}")
-
+                    
+            metrics.account_pool_requests_total.labels(queue=queue, status='success').inc()
+            
             return account
 
     async def next_available_at(self, queue: str):
