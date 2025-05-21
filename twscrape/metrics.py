@@ -1,37 +1,44 @@
 import os
-from prometheus_client import Counter, Gauge, start_http_server, Histogram
+from prometheus_client import Counter, Gauge, start_http_server, Histogram, CollectorRegistry
+
+metrics_reg = CollectorRegistry()
 
 # --- API Calls ---
 api_calls_total = Counter(
     "twscrape_api_calls_total",
     "Total number of API calls made",
-    ["operation", "method", "status_code", "outcome"],
+    ["operation",, "method", "status_code", "outcome"],
     # outcome: success, http_error, ratelimited, ban_detected, dependency_error, auth_error, missing_content, unknown_api_error, handled_error_retry, aborted_request, network_error_retry
+    registry=metrics_reg,
 )
 
 api_call_latency = Histogram(
     "twscrape_api_call_latency_seconds",
     "Latency of API calls",
-    ["operation", "method"],
+    ["operation", ,"method"],
+    registry=metrics_reg,
 )
 
 # --- Account Pool ---
 account_pool_requests_total = Counter(
     "twscrape_account_pool_requests_total",
     "Total number of requests to the account pool for an account",
-    ["queue", "status"],  # status: success, no_account_available, waiting, no_account_raised
+    ["queue", "status"],  # s,tatus: success, no_account_available, waiting, no_account_raised
+    registry=metrics_reg,
 )
 
 account_status_gauge = Gauge(
     "twscrape_account_status_count",
     "Number of accounts by status",
-    ["status"]  # status: active, inactive, error
+    ["status"]  # stat,us: active, inactive, error
+    registry=metrics_reg,
 )
 
 account_locks_gauge = Gauge(
     "twscrape_account_locks_per_queue_count",
     "Number of locked accounts by queue",
-    ["queue"]
+    ["queue"],
+    registry=metrics_reg,
 )
 # Store known queues to handle labels that might disappear
 _known_lock_queues = set()
@@ -43,6 +50,7 @@ login_attempts_total = Counter(
     "Total number of login attempts",
     ["username", "status"],
     # status: success, http_error, mfa_error, email_code_error, email_login_error, unknown_error
+    registry=metrics_reg,
 )
 
 # --- IMAP Operations ---
@@ -50,6 +58,7 @@ imap_operations_total = Counter(
     "twscrape_imap_operations_total",
     "Total number of IMAP operations",
     ["operation", "email_domain", "status"],  # operation: login, get_code; status: success, failure, timeout
+    registry=metrics_reg,
 )
 
 # --- XClId Generation ---
@@ -57,6 +66,7 @@ xclid_generation_total = Counter(
     "twscrape_xclid_generation_total",
     "Total number of X-Client-ID generation attempts (create)",
     ["status"],  # status: success, failure
+    registry=metrics_reg,
 )
 
 
