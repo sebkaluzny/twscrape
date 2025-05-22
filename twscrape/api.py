@@ -514,3 +514,12 @@ class API:
             async for rep in gen:
                 for x in parse_tweets(rep.json(), limit):
                     yield x
+
+    async def getip_raw(self, kv: KV = None):
+        async with QueueClient(self.pool, "ip", self.debug, proxy=self.proxy) as client:
+            rep = await client.get(f"https://api.ipify.org?format=json")
+            if rep is None:
+                return
+
+            obj = rep.json()
+            return obj
