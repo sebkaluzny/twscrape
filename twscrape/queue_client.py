@@ -68,6 +68,7 @@ class Ctx:
             print("url", url)
             print("params", params)
             print("headers", hdr)
+            print()
             rep = await self.clt.request(method, url, params=params, headers=hdr)
             if rep.status_code != 404:
                 return rep

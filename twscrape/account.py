@@ -71,5 +71,8 @@ class Account(JSONTrait):
 
         if "ct0" in client.cookies:
             client.headers["x-csrf-token"] = client.cookies["ct0"]
+            
+        print("client.headers", client.headers)
+        print("client.cookies", client.cookies)
 
         return client
