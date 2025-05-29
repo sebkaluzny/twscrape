@@ -64,6 +64,10 @@ class Ctx:
         while tries < 3:
             gen = await XClIdGenStore.get(self.acc.username, fresh=tries > 0)
             hdr = {"x-client-transaction-id": gen.calc(method, path)}
+            print("method", method)
+            print("url", url)
+            print("params", params)
+            print("headers", hdr)
             rep = await self.clt.request(method, url, params=params, headers=hdr)
             if rep.status_code != 404:
                 return rep
